@@ -198,24 +198,164 @@ class Planner:
     # Extension point
     # ------------------------------------------------------------------
 
+    def _resolve_coordinate(self, pos: Any, state: dict) -> tuple[int, int] | None:
+        if isinstance(pos, tuple) and len(pos) == 2:
+            return int(pos[0]), int(pos[1])
+        
+        if isinstance(pos, dict):
+            if "cx" in pos and "cy" in pos:
+                return int(pos["cx"]), int(pos["cy"])
+            cls = pos.get("class")
+            if cls:
+                dets = state.get("objects_by_class", {}).get(cls, [])
+                idx = pos.get("instance", 0)
+                if idx < len(dets):
+                    return int(dets[idx]["cx"]), int(dets[idx]["cy"])
+                    
+        if isinstance(pos, str):
+            dets = state.get("objects_by_class", {}).get(pos, [])
+            if dets:
+                return int(dets[0]["cx"]), int(dets[0]["cy"])
+                
+        return None
+
     def _compute_path(self, from_pos: Any, to_pos: Any) -> list[Command]:
-        """
-        Override to implement a real path-planning algorithm.
+        state = self._evaluator.assess() if self._evaluator else {}
+        detections = state.get("detections", [])
 
-        The method receives the raw *from_pos* / *to_pos* values passed by the
-        caller.  Use ``self._evaluator.assess()`` to read the current world
-        state (obstacle centroids, etc.) if needed.
+        # 1. Resolve coordinates
+        p1 = self._resolve_coordinate(from_pos, state)
+        p2 = self._resolve_coordinate(to_pos, state)
 
-        Must return an ordered ``list[Command]`` (may be empty).
+        if not p1 or not p2:
+            logger.warning(f"Could not resolve path coordinates: from_pos={from_pos!r} -> {p1!r}, to_pos={to_pos!r} -> {p2!r}")
+            return []
 
-        Example skeleton for pixel-coordinate A*::
+        x1, y1 = p1
+        x2, y2 = p2
 
-            def _compute_path(self, from_pos, to_pos):
-                state = self._evaluator.assess() if self._evaluator else {}
-                obstacles = {(d["cx"], d["cy"]) for d in state.get("detections", [])}
-                # ... run A* on a grid derived from camera resolution ...
-                # ... translate grid path to Commands ...
-                return commands
-        """
-        # --- STUB: replace with real path planning ---
-        return []
+        # 2. Get frame dimensions dynamically
+        w_orig, h_orig = 640, 480
+        if self._evaluator and hasattr(self._evaluator, "_detector"):
+            detector = self._evaluator._detector
+            if hasattr(detector, "_reader") and hasattr(detector._reader, "get_dimensions"):
+                w_orig, h_orig = detector._reader.get_dimensions()
+
+        # 3. Setup grid dimensions (32 cols x 24 rows) and calculate dynamic cell sizes
+        grid_w, grid_h = 32, 24
+        cell_w = w_orig / grid_w
+        cell_h = h_orig / grid_h
+
+        grid = [[0 for _ in range(grid_w)] for _ in range(grid_h)]
+
+        # Convert start/end coordinates to grid indices
+        col1 = min(grid_w - 1, max(0, int(x1 / cell_w)))
+        row1 = min(grid_h - 1, max(0, int(y1 / cell_h)))
+        col2 = min(grid_w - 1, max(0, int(x2 / cell_w)))
+        row2 = min(grid_h - 1, max(0, int(y2 / cell_h)))
+
+        # 4. Mark obstacle cells
+        # Obstacles are any detections whose class_name is NOT from_pos and NOT to_pos
+        for det in detections:
+            cls_name = det.get("class_name")
+            if cls_name == "path" or cls_name == from_pos or cls_name == to_pos:
+                continue
+
+            ox, oy, ow, oh = det.get("x", 0), det.get("y", 0), det.get("w", 0), det.get("h", 0)
+            margin = 10
+            bx1 = max(0, int((ox - margin) / cell_w))
+            by1 = max(0, int((oy - margin) / cell_h))
+            bx2 = min(grid_w - 1, int((ox + ow + margin) / cell_w))
+            by2 = min(grid_h - 1, int((oy + oh + margin) / cell_h))
+
+            for r in range(by1, by2 + 1):
+                for c in range(bx1, bx2 + 1):
+                    grid[r][c] = 1  # Blocked
+
+        # Feasibility check: make sure start/end coordinates are always unblocked
+        grid[row1][col1] = 0
+        grid[row2][col2] = 0
+
+        # 5. A* Search
+        import heapq
+        def heuristic(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+        start = (row1, col1)
+        goal = (row2, col2)
+
+        queue = []
+        heapq.heappush(queue, (0.0, start))
+        came_from = {start: None}
+        cost_so_far = {start: 0.0}
+
+        found = False
+        while queue:
+            _, current = heapq.heappop(queue)
+
+            if current == goal:
+                found = True
+                break
+
+            r, c = current
+            # 8-way connectivity
+            neighbors = []
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < grid_h and 0 <= nc < grid_w:
+                    if grid[nr][nc] == 0:
+                        step_cost = 1.414 if (dr != 0 and dc != 0) else 1.0
+                        neighbors.append(((nr, nc), step_cost))
+
+            for next_node, step_cost in neighbors:
+                new_cost = cost_so_far[current] + step_cost
+                if next_node not in cost_so_far or new_cost < cost_so_far[next_node]:
+                    cost_so_far[next_node] = new_cost
+                    priority = new_cost + heuristic(next_node, goal)
+                    heapq.heappush(queue, (priority, next_node))
+                    came_from[next_node] = current
+
+        # 6. Translate path to waypoints and Commands
+        waypoints = []
+        commands = []
+        if found:
+            path_cells = []
+            curr = goal
+            while curr is not None:
+                path_cells.append(curr)
+                curr = came_from[curr]
+            path_cells.reverse()
+
+            for r, c in path_cells:
+                wp_x = int((c + 0.5) * cell_w)
+                wp_y = int((r + 0.5) * cell_h)
+                waypoints.append([wp_x, wp_y])
+
+            # Translate step-by-step path grid offsets to Command directions
+            for i in range(len(path_cells) - 1):
+                r, c = path_cells[i]
+                nr, nc = path_cells[i+1]
+
+                # Horizontal
+                if nc > c:
+                    commands.append(Command.RIGHT)
+                elif nc < c:
+                    commands.append(Command.LEFT)
+
+                # Vertical
+                if nr > r:
+                    commands.append(Command.BACKWARD)
+                elif nr < r:
+                    commands.append(Command.FORWARD)
+        else:
+            logger.warning("No path found via grid A*.")
+            # Set direct line fallback path
+            waypoints = [[x1, y1], [x2, y2]]
+
+        # 7. Save path on detector instance if wired
+        if self._evaluator and hasattr(self._evaluator, "_detector"):
+            detector = self._evaluator._detector
+            if hasattr(detector, "set_current_path"):
+                detector.set_current_path(waypoints)
+
+        return commands

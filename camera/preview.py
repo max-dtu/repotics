@@ -42,6 +42,7 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
         ord("s"): "stop_recording",
         ord("c"): "capture",
         ord("d"): "toggle_detect",
+        ord("x"): "clear_tracked",
         9: "cycle_detector",  # Tab key
     }
 
@@ -72,12 +73,22 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
                 log.warning(f"Could not enqueue command '{action}': {e}")
         return False
 
-    window_name = "Camera Preview [r=record  s=stop  c=capture  d=detect  q=quit]"
+    window_name = "Camera Preview [r=record  s=stop  c=capture  d=detect  x=clear  click=track  q=quit]"
     error_count = 0
     max_errors = 10
 
     try:
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+        
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                log.info(f"Mouse clicked at x={x}, y={y} — sending click command.")
+                try:
+                    cmd_queue.put_nowait(f"click:{x},{y}")
+                except Exception as e:
+                    log.warning(f"Could not enqueue click command: {e}")
+
+        cv2.setMouseCallback(window_name, mouse_callback)
 
         while not exit_event.is_set():
             try:
@@ -102,6 +113,8 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
             overlay = frame.copy()
             has_masks = False
             for det in detections:
+                if det.get("class_name") == "path":
+                    continue
                 polygon = det.get("polygon")
                 if polygon:
                     has_masks = True
@@ -116,6 +129,8 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
 
             # Draw bounding boxes and text labels on top (opaque)
             for det in detections:
+                if det.get("class_name") == "path":
+                    continue
                 x = det.get("x", 0)
                 y = det.get("y", 0)
                 w = det.get("w", 0)
@@ -145,6 +160,15 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
                     1,
                     cv2.LINE_AA,
                 )
+
+            # Draw path waypoints if present
+            path_det = next((d for d in detections if d.get("class_name") == "path"), None)
+            if path_det and path_det.get("points"):
+                import numpy as np
+                pts = np.array(path_det["points"], dtype=np.int32)
+                cv2.polylines(frame, [pts], isClosed=False, color=(0, 255, 0), thickness=3)
+                for pt in path_det["points"]:
+                    cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
 
             try:
                 cv2.imshow(window_name, frame)
@@ -423,7 +447,21 @@ class PreviewManager:
 
             logger.info(f"Dispatching preview command: '{cmd}'")
             try:
-                if cmd == "record":
+                if cmd.startswith("click:"):
+                    try:
+                        _, coords = cmd.split(":", 1)
+                        x_str, y_str = coords.split(",", 1)
+                        x, y = int(x_str), int(y_str)
+                        if hasattr(self._detector, "set_click_target"):
+                            self._detector.set_click_target(x, y)
+                    except Exception as e:
+                        logger.error(f"Failed to parse click command '{cmd}': {e}")
+
+                elif cmd == "clear_tracked":
+                    if hasattr(self._detector, "clear_tracked_objects"):
+                        self._detector.clear_tracked_objects()
+
+                elif cmd == "record":
                     ts = time.strftime("%Y%m%d_%H%M%S")
                     path = f"recording_{ts}.mp4"
                     self._recorder.start(path)
