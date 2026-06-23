@@ -69,6 +69,7 @@ class Detector:
         self._model_path: str | None = None
         self._confidence: float = 0.5
         self._classes: list[str] | None = None
+        self._imgsz: int | tuple | None = None
         self._first_frame = False
 
     @property
@@ -79,13 +80,45 @@ class Detector:
     def model_path(self) -> str | None:
         return self._model_path
 
+    @model_path.setter
+    def model_path(self, value: str | None) -> None:
+        with self._state_lock:
+            if self._model_path != value:
+                self._model_path = value
+                logger.info(f"Detector model path updated to: {value}")
+
     @property
     def confidence(self) -> float:
         return self._confidence
 
+    @confidence.setter
+    def confidence(self, value: float) -> None:
+        with self._state_lock:
+            if self._confidence != value:
+                self._confidence = value
+                logger.info(f"Detector confidence threshold updated to: {value}")
+
     @property
     def classes(self) -> list[str] | None:
         return self._classes
+
+    @classes.setter
+    def classes(self, value: list[str] | None) -> None:
+        with self._state_lock:
+            if self._classes != value:
+                self._classes = value
+                logger.info(f"Detector class filter updated to: {value}")
+
+    @property
+    def imgsz(self) -> int | tuple | None:
+        return self._imgsz
+
+    @imgsz.setter
+    def imgsz(self, value: int | tuple | None) -> None:
+        with self._state_lock:
+            if self._imgsz != value:
+                self._imgsz = value
+                logger.info(f"Detector imgsz updated to: {value}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -97,6 +130,7 @@ class Detector:
         *,
         confidence: float = 0.5,
         classes: list[str] | None = None,
+        imgsz: int | tuple | None = None,
     ) -> None:
         """
         Start the detection pipeline.  Idempotent — safe to call if already running.
@@ -107,6 +141,7 @@ class Detector:
                      Defaults to 'yolov8n.pt' if not provided.
         confidence:  Minimum confidence threshold for reported detections.
         classes:     Optional allow-list of class names (None = all classes).
+        imgsz:       Optional image size for inference (e.g., 320, 640).
         """
         with self._state_lock:
             if self._thread and self._thread.is_alive():
@@ -123,6 +158,7 @@ class Detector:
             self._model_path = model_path
             self._confidence = confidence
             self._classes = classes
+            self._imgsz = imgsz
             self._first_frame = True
 
             q: queue.Queue = queue.Queue(maxsize=1)
@@ -135,7 +171,7 @@ class Detector:
 
             self._thread = threading.Thread(
                 target=self._inference_loop,
-                args=(q, stop_event, model_path, confidence, classes),
+                args=(q, stop_event),
                 name="DetectorThread",
                 daemon=True,
             )
@@ -189,9 +225,6 @@ class Detector:
         self,
         q: queue.Queue,
         stop_event: threading.Event,
-        model_path: str | None,
-        confidence: float,
-        classes: list[str] | None,
     ) -> None:
         logger.info("Detector inference loop active.")
         try:
@@ -205,7 +238,13 @@ class Detector:
                     logger.info("Detector received stop sentinel.")
                     break
 
-                detections = self._run_inference(frame, model_path, confidence, classes)
+                with self._state_lock:
+                    model_path = self._model_path
+                    confidence = self._confidence
+                    classes = self._classes
+                    imgsz = self._imgsz
+
+                detections = self._run_inference(frame, model_path, confidence, classes, imgsz)
                 
                 if self._first_frame:
                     self._first_frame = False
@@ -227,6 +266,7 @@ class Detector:
         model_path: str | None,
         confidence: float,
         classes: list[str] | None,
+        imgsz: int | tuple | None = None,
     ) -> list[dict]:
         """
         Runs object detection/segmentation using YOLOv8 and/or SAM models.
@@ -277,7 +317,10 @@ class Detector:
 
         # Mode 1: Combined YOLO + SAM
         if yolo_path and sam_path:
-            yolo_results = self._cached_yolo_model(frame, conf=confidence, verbose=False)[0]
+            yolo_kwargs = {"conf": confidence, "verbose": False}
+            if imgsz is not None:
+                yolo_kwargs["imgsz"] = imgsz
+            yolo_results = self._cached_yolo_model(frame, **yolo_kwargs)[0]
             bboxes = []
             yolo_dets = []
 
@@ -318,7 +361,10 @@ class Detector:
 
         # Mode 2: YOLO Only (Detection or Segmentation)
         elif yolo_path:
-            results = self._cached_yolo_model(frame, conf=confidence, verbose=False)[0]
+            yolo_kwargs = {"conf": confidence, "verbose": False}
+            if imgsz is not None:
+                yolo_kwargs["imgsz"] = imgsz
+            results = self._cached_yolo_model(frame, **yolo_kwargs)[0]
             has_masks = results.masks is not None
 
             for i, box in enumerate(results.boxes):

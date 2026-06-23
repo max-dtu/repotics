@@ -57,6 +57,10 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
         """Dispatch a keypress.  Returns True if the preview should exit."""
         if key == ord("q"):
             log.info("'q' pressed. Closing preview.")
+            try:
+                cmd_queue.put_nowait("quit")
+            except Exception:
+                pass
             exit_event.set()
             return True
         action = _KEY_ACTIONS.get(key)
@@ -218,10 +222,11 @@ class PreviewManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def start_and_block(self) -> None:
+    def start(self, block: bool = False) -> None:
         """
-        Spawns the preview subprocess and **blocks** until the window is closed.
-        Call camera.close() after this returns if you want a full shutdown.
+        Spawns the preview subprocess.
+        By default, runs in the background (non-blocking).
+        Pass block=True to block the REPL until the window is closed.
         """
         with self._state_lock:
             if self._previewing:
@@ -275,8 +280,9 @@ class PreviewManager:
             self._previewing = True
             logger.info("Preview window open. Press q to close.")
 
-        # Block the REPL until the preview window is closed (q pressed)
-        proc.join()
+        if block:
+            # Block the REPL until the preview window is closed (q pressed)
+            proc.join()
 
     def stop(self) -> None:
         """Stops the preview subprocess and waits for it to exit."""
@@ -440,7 +446,7 @@ class PreviewManager:
                         self._detector.stop()
                         logger.info("Detection stopped.")
                     else:
-                        self._detector.start(self._detector.model_path, confidence=self._detector.confidence, classes=self._detector.classes)
+                        self._detector.start(self._detector.model_path, confidence=self._detector.confidence, classes=self._detector.classes, imgsz=self._detector.imgsz)
                         logger.info("Detection started.")
 
                 elif cmd == "cycle_detector":
@@ -467,11 +473,16 @@ class PreviewManager:
                         # Preserve other options
                         conf = self._detector.confidence
                         cls = self._detector.classes
+                        imgsz = self._detector.imgsz
                         
                         self._detector.stop()
-                        self._detector.start(new_model, confidence=conf, classes=cls)
+                        self._detector.start(new_model, confidence=conf, classes=cls, imgsz=imgsz)
                     else:
                         logger.info("Ignoring detector cycle: detection is not running (press 'd' to enable).")
+
+                elif cmd == "quit":
+                    logger.info("Preview subprocess signaled exit. Stopping preview subsystems.")
+                    threading.Thread(target=self.stop, name="PreviewStopThread", daemon=True).start()
 
                 else:
                     logger.warning(f"Unknown command from preview process: '{cmd}'")

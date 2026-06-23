@@ -85,20 +85,27 @@ class Camera:
     # Preview
     # ------------------------------------------------------------------
 
-    def preview(self) -> None:
+    def preview(self, block: bool = False) -> None:
         """
-        Opens a live preview window and BLOCKS until the window is closed.
+        Opens a live preview window.
+
+        By default, runs in the background (non-blocking), allowing you to interact with the
+        Python prompt to adjust settings dynamically while the preview is open.
+        Pass block=True if you want to block the REPL until the window is closed.
 
         Keyboard shortcuts in the window:
             r — start recording   (auto-named .mp4)
             s — stop  recording
             c — capture frame     (auto-named .jpg)
             d — toggle detection  (start / stop; boxes drawn when running)
-            q — close preview and shut down the camera
+            q — close preview
         """
         self.open()
-        self._preview.start_and_block()
-        self.close()
+        if block:
+            self._preview.start(block=True)
+            self.close()
+        else:
+            self._preview.start(block=False)
 
     def stop_preview(self) -> None:
         """Stops the preview subprocess."""
@@ -127,6 +134,7 @@ class Camera:
         *,
         confidence: float = 0.5,
         classes: list[str] | None = None,
+        imgsz: int | tuple | None = None,
     ) -> None:
         """
         Starts the object detection pipeline.
@@ -134,12 +142,12 @@ class Camera:
         Parameters
         ----------
         model_path:  Path passed through to Detector._run_inference.
-                     Ignored by the built-in stub.
         confidence:  Minimum score threshold for reported detections.
         classes:     Optional allow-list of class names (None = all classes).
+        imgsz:       Optional image size for inference (e.g., 320, 640).
         """
         self.open()
-        self._detector.start(model_path, confidence=confidence, classes=classes)
+        self._detector.start(model_path, confidence=confidence, classes=classes, imgsz=imgsz)
 
     def stop_detection(self) -> None:
         """Stops the object detection pipeline."""
@@ -155,3 +163,47 @@ class Camera:
         processed yet.  Thread-safe.
         """
         return self._detector.get_detections()
+
+    # ------------------------------------------------------------------
+    # Dynamic parameter configuration properties
+    # ------------------------------------------------------------------
+
+    @property
+    def model_path(self) -> str | None:
+        """Returns the currently configured model path."""
+        return self._detector.model_path
+
+    @model_path.setter
+    def model_path(self, value: str | None) -> None:
+        """Dynamically updates the model path on the fly."""
+        self._detector.model_path = value
+
+    @property
+    def confidence(self) -> float:
+        """Returns the currently configured detection confidence threshold."""
+        return self._detector.confidence
+
+    @confidence.setter
+    def confidence(self, value: float) -> None:
+        """Dynamically updates the detection confidence threshold on the fly."""
+        self._detector.confidence = value
+
+    @property
+    def classes(self) -> list[str] | None:
+        """Returns the currently configured class filter."""
+        return self._detector.classes
+
+    @classes.setter
+    def classes(self, value: list[str] | None) -> None:
+        """Dynamically updates the class filter on the fly."""
+        self._detector.classes = value
+
+    @property
+    def imgsz(self) -> int | tuple | None:
+        """Returns the currently configured image size."""
+        return self._detector.imgsz
+
+    @imgsz.setter
+    def imgsz(self, value: int | tuple | None) -> None:
+        """Dynamically updates the image size on the fly."""
+        self._detector.imgsz = value
