@@ -60,6 +60,27 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
         random.setstate(state)
         return color
 
+    def _draw_dashed_rect(img, x1, y1, x2, y2, color, thickness=2, dash=10, gap=6):
+        """Draw a dashed-border rectangle on *img* in-place."""
+        import numpy as np
+        corners = [(x1, y1, x2, y1), (x2, y1, x2, y2), (x2, y2, x1, y2), (x1, y2, x1, y1)]
+        for ex1, ey1, ex2, ey2 in corners:
+            length = int(np.hypot(ex2 - ex1, ey2 - ey1))
+            if length == 0:
+                continue
+            ux, uy = (ex2 - ex1) / length, (ey2 - ey1) / length
+            pos = 0
+            draw = True
+            while pos < length:
+                seg = dash if draw else gap
+                end = min(pos + seg, length)
+                if draw:
+                    sx, sy = int(ex1 + ux * pos), int(ey1 + uy * pos)
+                    ex, ey = int(ex1 + ux * end), int(ey1 + uy * end)
+                    cv2.line(img, (sx, sy), (ex, ey), color, thickness)
+                pos = end
+                draw = not draw
+
     def _handle_key(key):
         """Dispatch a keypress.  Returns True if the preview should exit."""
         if key == ord("q"):
@@ -154,12 +175,14 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
                     frame_orig, detections = _last_payload[0]
                     frame = frame_orig.copy() # Make a copy to overlay drawings dynamically
 
-                    # Draw masks (polygons) on the overlay first
+                    # Draw masks (polygons) on the overlay first — skip lost objects
                     overlay = frame.copy()
                     has_masks = False
                     for det in detections:
                         if det.get("class_name") == "path":
                             continue
+                        if det.get("lost", False):
+                            continue  # no polygon for lost objects
                         polygon = det.get("polygon")
                         if polygon:
                             has_masks = True
@@ -182,19 +205,33 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
                         h = det.get("h", 0)
                         class_name = det.get("class_name", "?")
                         confidence = det.get("confidence", 0.0)
+                        is_lost  = det.get("lost", False)
+                        is_draft = "(draft)" in class_name
 
                         color = _get_class_color(class_name)
-                        label = f"{class_name} {confidence:.2f}"
 
-                        # Draw bounding box
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                        if is_lost:
+                            # Dashed gray border — shows last known position
+                            _draw_dashed_rect(frame, x, y, x + w, y + h, (160, 160, 160), 2)
+                            label_bg = (80, 80, 80)
+                            label = f"{class_name} ?"
+                        elif is_draft:
+                            # Thin colored border — live re-anchored draft
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
+                            label_bg = color
+                            label = f"{class_name} {confidence:.2f}"
+                        else:
+                            # Normal solid border — actively tracked
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                            label_bg = color
+                            label = f"{class_name} {confidence:.2f}"
 
                         # Draw a nice background box for text label to make it readable
                         (lbl_w, lbl_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                         lbl_y_offset = max(y, lbl_h + baseline + 4)
-                        cv2.rectangle(frame, (x, lbl_y_offset - lbl_h - baseline - 2), (x + lbl_w, lbl_y_offset), color, cv2.FILLED)
+                        cv2.rectangle(frame, (x, lbl_y_offset - lbl_h - baseline - 2), (x + lbl_w, lbl_y_offset), label_bg, cv2.FILLED)
 
-                        # Draw white text on class color background
+                        # Draw white text on label background
                         cv2.putText(
                             frame,
                             label,
@@ -208,13 +245,14 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
                         # Draw heading arrow: centroid → live PCA tip
                         heading = det.get("heading")
                         if heading is not None:
-                            cx = det.get("cx", x + w // 2)
-                            cy = det.get("cy", y + h // 2)
+                            cx_det = det.get("cx", x + w // 2)
+                            cy_det = det.get("cy", y + h // 2)
                             hx, hy = int(heading[0]), int(heading[1])
-                            cv2.arrowedLine(frame, (cx, cy), (hx, hy), (255, 255, 255), 5, cv2.LINE_AA, tipLength=0.25)
-                            cv2.arrowedLine(frame, (cx, cy), (hx, hy), color, 3, cv2.LINE_AA, tipLength=0.25)
+                            arrow_color = (150, 150, 150) if is_lost else color
+                            cv2.arrowedLine(frame, (cx_det, cy_det), (hx, hy), (255, 255, 255), 5, cv2.LINE_AA, tipLength=0.25)
+                            cv2.arrowedLine(frame, (cx_det, cy_det), (hx, hy), arrow_color, 3, cv2.LINE_AA, tipLength=0.25)
                             cv2.circle(frame, (hx, hy), 5, (255, 255, 255), -1)
-                            cv2.circle(frame, (hx, hy), 4, color, -1)
+                            cv2.circle(frame, (hx, hy), 4, arrow_color, -1)
 
                     # Draw path waypoints if present
                     path_det = next((d for d in detections if d.get("class_name") == "path"), None)
@@ -547,6 +585,8 @@ class PreviewManager:
 
             logger.info(f"Dispatching preview command: '{cmd}'")
             try:
+                # Legacy / API-only: the preview subprocess sends box_click: only.
+                # This branch is reachable by calling detector.set_click_target() directly.
                 if cmd.startswith("click:"):
                     try:
                         # New format:    click:x1,y1:x2,y2  (press → release)
@@ -653,7 +693,5 @@ class PreviewManager:
 
             except Exception as e:
                 logger.error(f"Error executing preview command '{cmd}': {e}")
-
-        logger.info("Command dispatcher thread stopped.")
 
         logger.info("Command dispatcher thread stopped.")

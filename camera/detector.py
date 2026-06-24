@@ -90,6 +90,10 @@ class Detector:
         # Maps object_id → last tracked bounding box size (to detect stationary state).
         self._last_sizes: dict = {}     # object_id → tuple[int, int]
         self._tracking_active = False
+        # True while the object has no current-frame match (keeps last known position).
+        self._lost_flags: dict[int, bool] = {}
+        # EMA-smoothed bbox per object: (cx, cy, w, h) — reduces jitter.
+        self._smoothed_bboxes: dict[int, tuple] = {}
 
     @property
     def is_running(self) -> bool:
@@ -229,6 +233,8 @@ class Detector:
             self._target_objects = []
             self._next_object_id = 0
             self._current_path = None
+            self._lost_flags = {}
+            self._smoothed_bboxes = {}
 
         with self._detections_lock:
             self._latest_detections = []
@@ -271,11 +277,14 @@ class Detector:
         mag = np.linalg.norm(drag_vec)
         init_vec = drag_vec / mag if mag > 1e-6 else np.array([1.0, 0.0], dtype=np.float32)
         with self._state_lock:
-            self._click_headings[self._next_object_id] = (hx, hy)
-            self._heading_vecs[self._next_object_id] = init_vec
-            self._pending_clicks.append((x, y))
+            # Pre-assign the ID here so rapid successive clicks each get a unique key.
+            obj_id = self._next_object_id
+            self._next_object_id += 1
+            self._click_headings[obj_id] = (hx, hy)
+            self._heading_vecs[obj_id] = init_vec
+            self._pending_clicks.append((obj_id, x, y))
             logger.info(
-                f"Detector click target added: object_{self._next_object_id} "
+                f"Detector click target added: object_{obj_id} "
                 f"press=({x},{y}) heading=({hx},{hy}) "
                 f"init_vec=({init_vec[0]:.2f},{init_vec[1]:.2f})"
             )
@@ -296,12 +305,15 @@ class Detector:
         mag = np.linalg.norm(drag_vec)
         init_vec = drag_vec / mag if mag > 1e-6 else np.array([1.0, 0.0], dtype=np.float32)
         with self._state_lock:
+            # Pre-assign the ID here so rapid successive box registrations each get a unique key.
+            obj_id = self._next_object_id
+            self._next_object_id += 1
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            self._click_headings[self._next_object_id] = (cx, cy)
-            self._heading_vecs[self._next_object_id] = init_vec
-            self._pending_boxes.append((x1, y1, x2, y2))
+            self._click_headings[obj_id] = (cx, cy)
+            self._heading_vecs[obj_id] = init_vec
+            self._pending_boxes.append((obj_id, x1, y1, x2, y2))
             logger.info(
-                f"Detector box target added: object_{self._next_object_id} "
+                f"Detector box target added: object_{obj_id} "
                 f"box=({x1},{y1},{x2},{y2}) heading=(({hx1},{hy1})->({hx2},{hy2})) "
                 f"init_vec=({init_vec[0]:.2f},{init_vec[1]:.2f})"
             )
@@ -325,6 +337,8 @@ class Detector:
             self._pending_clicks = []
             self._pending_boxes = []
             self._tracking_active = False
+            self._lost_flags = {}
+            self._smoothed_bboxes = {}
             logger.info("Cleared all tracked objects, headings, and path.")
 
     def start_tracking(self) -> None:
@@ -513,8 +527,8 @@ class Detector:
                         "h": by2 - by1,
                     })
 
-                # Process clicks
-                for click_x, click_y in clicks:
+                # Process clicks — obj_id was pre-assigned in set_click_target
+                for obj_id, click_x, click_y in clicks:
                     matched_cand = None
                     for cand in yolo_candidates:
                         bx1, by1, bx2, by2 = cand["box"]
@@ -526,7 +540,7 @@ class Detector:
                                 area_curr = (bx2 - bx1) * (by2 - by1)
                                 if area_curr < area_prev:
                                     matched_cand = cand
-                    
+
                     if matched_cand is not None:
                         box_class = matched_cand["class_name"]
                         target_token = matched_cand["token"]
@@ -546,8 +560,6 @@ class Detector:
                         poly_list = [[click_x - 20, click_y - 20], [click_x + 20, click_y - 20], [click_x + 20, click_y + 20], [click_x - 20, click_y + 20]]
 
                     with self._state_lock:
-                        obj_id = self._next_object_id
-                        self._next_object_id += 1
                         self._target_objects.append({
                             "id": obj_id,
                             "token": target_token,
@@ -558,8 +570,8 @@ class Detector:
                         self._last_sizes[obj_id] = (w, h)
                     logger.info(f"Target token initialized for object_{obj_id} ({box_class}) from click ({click_x}, {click_y})")
 
-                # Process boxes
-                for x1, y1, x2, y2 in boxes:
+                # Process boxes — obj_id was pre-assigned in set_box_target
+                for obj_id, x1, y1, x2, y2 in boxes:
                     snapped_cand = None
                     best_iou = 0.0
 
@@ -569,11 +581,11 @@ class Detector:
                         iy1 = max(y1, by1)
                         ix2 = min(x2, bx2)
                         iy2 = min(y2, by2)
-                        
+
                         iw = max(0, ix2 - ix1)
                         ih = max(0, iy2 - iy1)
                         inter_area = iw * ih
-                        
+
                         if inter_area > 0:
                             area_u = (x2 - x1) * (y2 - y1)
                             area_b = (bx2 - bx1) * (by2 - by1)
@@ -591,7 +603,7 @@ class Detector:
                             if dist < best_dist:
                                 best_dist = dist
                                 snapped_cand = cand
-                        
+
                         if best_dist > 150.0:
                             snapped_cand = None
 
@@ -611,8 +623,6 @@ class Detector:
                         logger.info(f"[Snapping] No matching YOLO object found near user box ({x1},{y1},{x2},{y2}). Using drawn box.")
 
                     with self._state_lock:
-                        obj_id = self._next_object_id
-                        self._next_object_id += 1
                         self._target_objects.append({
                             "id": obj_id,
                             "token": target_token,
@@ -634,41 +644,69 @@ class Detector:
                         obj_token = obj["token"]
                         obj_class = obj.get("class_name", "object")
 
+                        # ── Candidate selection: similarity-primary, proximity tiebreak ──
                         best_match = None
                         best_sim = -1.0
+                        prev_centroid = self._last_centroids.get(obj_id)
 
                         for cand in yolo_candidates:
                             sim = float(torch.dot(obj_token, cand["token"]).item())
-                            if sim > best_sim:
+                            if best_match is None or sim > best_sim:
                                 best_sim = sim
                                 best_match = cand
+                            elif prev_centroid is not None and (sim - best_sim) > -0.05:
+                                # Scores within 0.05 — tiebreak by proximity to last centroid
+                                prev_cx, prev_cy = prev_centroid
+                                new_dist = np.hypot(cand["cx"] - prev_cx, cand["cy"] - prev_cy)
+                                best_dist = np.hypot(best_match["cx"] - prev_cx, best_match["cy"] - prev_cy)
+                                if new_dist < best_dist:
+                                    best_sim = sim
+                                    best_match = cand
 
                         if best_sim >= 0.55 and best_match is not None:
+                            # ── Successful match ──────────────────────────────────────────
+                            self._lost_flags[obj_id] = False
+
                             matched_cx = best_match["cx"]
                             matched_cy = best_match["cy"]
                             matched_w = best_match["w"]
                             matched_h = best_match["h"]
                             matched_polygon = best_match["polygon"]
 
-                            prev_centroid = self._last_centroids.get(obj_id)
                             prev_size = self._last_sizes.get(obj_id)
-
                             self._last_centroids[obj_id] = (matched_cx, matched_cy)
                             self._last_sizes[obj_id] = (matched_w, matched_h)
 
+                            # EMA bbox smoothing — reduces per-frame jitter (alpha = 0.5)
+                            if obj_id in self._smoothed_bboxes:
+                                scx, scy, sw, sh = self._smoothed_bboxes[obj_id]
+                                scx = 0.5 * matched_cx + 0.5 * scx
+                                scy = 0.5 * matched_cy + 0.5 * scy
+                                sw  = 0.5 * matched_w  + 0.5 * sw
+                                sh  = 0.5 * matched_h  + 0.5 * sh
+                            else:
+                                scx, scy, sw, sh = matched_cx, matched_cy, matched_w, matched_h
+                            self._smoothed_bboxes[obj_id] = (scx, scy, sw, sh)
+
+                            # Slow token update on very confident matches to track appearance drift
+                            if best_sim >= 0.80:
+                                new_tok = 0.05 * best_match["token"] + 0.95 * obj_token
+                                obj["token"] = new_tok / (float(new_tok.norm()) + 1e-8)
+
                             det = {
-                                "x": int(best_match["box"][0]),
-                                "y": int(best_match["box"][1]),
-                                "w": int(matched_w),
-                                "h": int(matched_h),
-                                "cx": int(matched_cx),
-                                "cy": int(matched_cy),
+                                "x": int(scx - sw / 2),
+                                "y": int(scy - sh / 2),
+                                "w": int(sw),
+                                "h": int(sh),
+                                "cx": int(scx),
+                                "cy": int(scy),
                                 "class_name": f"{obj_class}_{obj_id}",
                                 "confidence": float(best_sim),
                                 "polygon": matched_polygon.tolist() if hasattr(matched_polygon, "tolist") else matched_polygon,
+                                "lost": False,
                             }
 
-                            # Heading tracking
+                            # ── Heading tracking (unchanged logic, smoothed bbox for arrow length) ──
                             heading_vec = self._heading_vecs.get(obj_id)
                             if heading_vec is not None:
                                 is_stationary = False
@@ -687,20 +725,20 @@ class Detector:
                                 v2 = box_pts[2] - box_pts[1]
                                 norm_v1 = np.linalg.norm(v1)
                                 norm_v2 = np.linalg.norm(v2)
-                                
+
                                 last_pca = self._pca_axes.get(obj_id)
-                                
+
                                 if norm_v1 > 1e-6 and norm_v2 > 1e-6:
                                     v1 = v1 / norm_v1
                                     v2 = v2 / norm_v2
-                                    candidates = [v1, -v1, v2, -v2]
-                                    
+                                    pca_candidates = [v1, -v1, v2, -v2]
+
                                     if last_pca is None:
-                                        new_pca = max(candidates, key=lambda c: np.dot(c, heading_vec))
+                                        new_pca = max(pca_candidates, key=lambda c: np.dot(c, heading_vec))
                                         if np.dot(new_pca, heading_vec) < 0:
                                             new_pca = -new_pca
                                     else:
-                                        new_pca = max(candidates, key=lambda c: np.dot(c, last_pca))
+                                        new_pca = max(pca_candidates, key=lambda c: np.dot(c, last_pca))
                                         if np.dot(new_pca, last_pca) < 0:
                                             new_pca = -new_pca
                                 else:
@@ -738,37 +776,99 @@ class Detector:
 
                                 self._pca_axes[obj_id] = smoothed_pca
 
-                                arrow_len = float(np.sqrt((matched_w / 2) ** 2 + (matched_h / 2) ** 2)) * 1.3
-                                tip_x = int(matched_cx + heading_vec[0] * arrow_len)
-                                tip_y = int(matched_cy + heading_vec[1] * arrow_len)
+                                # Arrow length uses smoothed bbox so it doesn't flicker
+                                arrow_len = float(np.sqrt((sw / 2) ** 2 + (sh / 2) ** 2)) * 1.3
+                                tip_x = int(scx + heading_vec[0] * arrow_len)
+                                tip_y = int(scy + heading_vec[1] * arrow_len)
                                 det["heading"] = [tip_x, tip_y]
                                 with self._state_lock:
                                     self._click_headings[obj_id] = (tip_x, tip_y)
 
                             logger.info(
-                                f"[{det['class_name']}] matched to YOLO candidate with sim={best_sim:.3f} "
-                                f"centroid=({int(matched_cx)},{int(matched_cy)}) bbox={int(matched_w)}x{int(matched_h)}"
+                                f"[{det['class_name']}] matched sim={best_sim:.3f} "
+                                f"centroid=({int(scx)},{int(scy)}) bbox={int(sw)}x{int(sh)}"
                             )
                             detections.append(det)
+
                         else:
-                            logger.info(f"Object_{obj_id} similarity ({best_sim:.3f}) below threshold. Object lost.")
-                            self._last_centroids.pop(obj_id, None)
-                            self._last_sizes.pop(obj_id, None)
+                            # ── Lost: preserve spatial state, emit at last known position ──
+                            self._lost_flags[obj_id] = True
+                            logger.info(f"Object_{obj_id} sim={best_sim:.3f} below threshold — lost (last pos kept).")
+
+                            scx, scy, sw, sh = self._smoothed_bboxes.get(
+                                obj_id,
+                                (*self._last_centroids.get(obj_id, (0.0, 0.0)),
+                                 *self._last_sizes.get(obj_id, (40, 40)))
+                            )
+
+                            heading_vec = self._heading_vecs.get(obj_id)
+                            heading_tip = None
+                            if heading_vec is not None:
+                                arrow_len = float(np.sqrt((sw / 2) ** 2 + (sh / 2) ** 2)) * 1.3
+                                heading_tip = [
+                                    int(scx + heading_vec[0] * arrow_len),
+                                    int(scy + heading_vec[1] * arrow_len),
+                                ]
+
+                            det = {
+                                "x": int(scx - sw / 2),
+                                "y": int(scy - sh / 2),
+                                "w": int(sw),
+                                "h": int(sh),
+                                "cx": int(scx),
+                                "cy": int(scy),
+                                "class_name": f"{obj_class}_{obj_id}",
+                                "confidence": float(best_sim),
+                                "lost": True,
+                                "heading": heading_tip,
+                            }
+                            detections.append(det)
+
                 else:
-                    # Inactive tracking: drafts rendering
+                    # ── Draft phase: live re-anchor each object per frame ─────────────────
                     for obj in self._target_objects:
                         obj_id = obj["id"]
+                        obj_token = obj["token"]
                         obj_class = obj.get("class_name", "object")
-                        cx, cy = self._last_centroids.get(obj_id, (0.0, 0.0))
-                        w, h = self._last_sizes.get(obj_id, (0, 0))
+
+                        # Re-match against current YOLO candidates so draft position stays live
+                        best_cand = None
+                        best_sim = -1.0
+                        prev_centroid = self._last_centroids.get(obj_id)
+
+                        for cand in yolo_candidates:
+                            sim = float(torch.dot(obj_token, cand["token"]).item())
+                            if best_cand is None or sim > best_sim:
+                                best_sim = sim
+                                best_cand = cand
+                            elif prev_centroid is not None and (sim - best_sim) > -0.05:
+                                prev_cx, prev_cy = prev_centroid
+                                if (np.hypot(cand["cx"] - prev_cx, cand["cy"] - prev_cy) <
+                                        np.hypot(best_cand["cx"] - prev_cx, best_cand["cy"] - prev_cy)):
+                                    best_sim = sim
+                                    best_cand = cand
+
+                        if best_cand is not None and best_sim >= 0.50:
+                            # Live position available — update stored state
+                            cx, cy = best_cand["cx"], best_cand["cy"]
+                            w, h = best_cand["w"], best_cand["h"]
+                            self._last_centroids[obj_id] = (cx, cy)
+                            self._last_sizes[obj_id] = (w, h)
+                            poly = best_cand["polygon"]
+                            obj["initial_polygon"] = poly.tolist() if hasattr(poly, "tolist") else poly
+                        else:
+                            # Object temporarily not visible — fall back to stored position
+                            cx, cy = self._last_centroids.get(obj_id, (0.0, 0.0))
+                            w, h = self._last_sizes.get(obj_id, (0, 0))
+
                         heading_vec = self._heading_vecs.get(obj_id)
-                        
                         heading_tip = None
                         if heading_vec is not None:
                             arrow_len = float(np.sqrt((w / 2) ** 2 + (h / 2) ** 2)) * 1.3
-                            hx = cx + heading_vec[0] * arrow_len
-                            hy = cy + heading_vec[1] * arrow_len
-                            heading_tip = [int(hx), int(hy)]
+                            heading_tip = [
+                                int(cx + heading_vec[0] * arrow_len),
+                                int(cy + heading_vec[1] * arrow_len),
+                            ]
 
                         det = {
                             "x": int(cx - w / 2),
