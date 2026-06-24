@@ -227,6 +227,61 @@ class Robot:
             execute=execute,
         )
 
+    def go_to_nearest_ball(
+        self,
+        *,
+        ball_classes: list[str] | tuple[str, ...] = ("WhiteBall", "OrangeBall", "orange_ball", "white_ball"),
+        robot_class: str = "Car",
+        step_delay: float = 0.5,
+        execute: bool = True,
+    ) -> list[Command]:
+        """
+        Find the closest ball to the robot and drive to it.
+
+        Searches across all *ball_classes*, picks the nearest one by centroid
+        distance, plans an A* path, and optionally executes it.
+
+        Parameters
+        ----------
+        ball_classes:
+            Class names to consider as balls.
+        robot_class:
+            Class name used by the model for the robot (default: ``"Car"``).
+        step_delay:
+            Pause between commands in seconds.
+        execute:
+            ``True`` (default) to send commands; ``False`` to plan only.
+
+        Returns
+        -------
+        List of planned commands, or ``[]`` if robot or balls are not detected.
+        """
+        state = self._evaluator.assess()
+        robot_dets = state["objects_by_class"].get(robot_class, [])
+        if not robot_dets:
+            logger.warning(
+                f"go_to_nearest_ball: robot not detected (looked for class '{robot_class}'). "
+                f"Available classes: {list(state['objects_by_class'].keys())}"
+            )
+            return []
+        robot_pos = (robot_dets[0]["cx"], robot_dets[0]["cy"])
+
+        target = self._spatial.find_nearest_of_any(list(ball_classes), from_pos=robot_pos, state=state)
+        if target is None:
+            logger.warning("go_to_nearest_ball: no balls detected.")
+            return []
+
+        logger.info(
+            f"go_to_nearest_ball: targeting '{target['class_name']}' "
+            f"at ({target['cx']}, {target['cy']})"
+        )
+        return self.find_path(
+            robot_pos,
+            (target["cx"], target["cy"]),
+            step_delay=step_delay,
+            execute=execute,
+        )
+
     def find_best_path(
         self,
         from_pos: Any,

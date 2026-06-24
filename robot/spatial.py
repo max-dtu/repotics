@@ -165,6 +165,29 @@ class Spatial:
             return None
         return self.rank_by_distance(from_pos, candidates)[0]
 
+    def find_nearest_of_any(
+        self,
+        class_names: list[str],
+        from_pos: tuple = (0, 0),
+        state: dict | None = None,
+    ) -> dict | None:
+        """
+        Return the detection closest to *from_pos* across all *class_names*, or
+        ``None`` if none of those classes are present.
+
+        ::
+
+            ball = spatial.find_nearest_of_any(["orange_ball", "white_ball"], from_pos=(320, 240))
+        """
+        s = self._resolve_state(state)
+        candidates = []
+        for cls in class_names:
+            candidates.extend(s.get("objects_by_class", {}).get(cls, []))
+        if not candidates:
+            logger.debug(f"find_nearest_of_any: no detections for classes {class_names}.")
+            return None
+        return self.rank_by_distance(from_pos, candidates)[0]
+
     def find_closest_pair(
         self,
         class_a: str,

@@ -74,6 +74,8 @@ robot = Robot(detector=camera._detector, backend=_ev3_backend)
 
 BANNER = """
   robot.assess()                           — see all detected objects
+  robot.go_to_nearest_ball()               — drive to the closest ball (auto)
+  robot.go_to_nearest_ball(execute=False)  — plan path only, no movement
   robot.find_path("robot", "white_ball")   — drive robot to white ball
   robot.find_path("robot", "orange_ball")  — drive robot to orange ball
   robot.find_path("white_ball", "big_goal")— plan ball → goal path
