@@ -37,6 +37,10 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
     log = logging.getLogger("camera.preview")
     log.info("Preview process started.")
 
+    _init_box = [None]
+    _need_redraw = [True]
+    _last_payload = [None]
+
     _KEY_ACTIONS = {
         ord("r"): "record",
         ord("s"): "stop_recording",
@@ -44,6 +48,8 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
         ord("d"): "toggle_detect",
         ord("x"): "clear_tracked",
         9: "cycle_detector",  # Tab key
+        13: "start_tracking",  # Enter key
+        32: "start_tracking",  # Space key
     }
 
     def _get_class_color(class_name):
@@ -65,6 +71,9 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
             exit_event.set()
             return True
         action = _KEY_ACTIONS.get(key)
+        if key == ord("x"):
+            _init_box[0] = None
+            _need_redraw[0] = True
         if action:
             log.info(f"'{chr(key)}' pressed — sending '{action}' command.")
             try:
@@ -79,106 +88,197 @@ def _run_preview_process(frame_queue, cmd_queue, exit_event):
 
     try:
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
-        
+
+        # Drag state — initialised here so the frame loop always finds them
+        _drag_start = None
+        _drag_current = [None]   # list wrapper so the nested closure can write it
+
         def mouse_callback(event, x, y, flags, param):
+            nonlocal _drag_start
             if event == cv2.EVENT_LBUTTONDOWN:
-                log.info(f"Mouse clicked at x={x}, y={y} — sending click command.")
-                try:
-                    cmd_queue.put_nowait(f"click:{x},{y}")
-                except Exception as e:
-                    log.warning(f"Could not enqueue click command: {e}")
+                _drag_start = (x, y)
+                _need_redraw[0] = True
+            elif event == cv2.EVENT_MOUSEMOVE:
+                _drag_current[0] = (x, y)
+                if _drag_start is not None:
+                    _need_redraw[0] = True
+            elif event == cv2.EVENT_LBUTTONUP:
+                if _drag_start is not None:
+                    sx, sy = _drag_start
+                    if _init_box[0] is None:
+                        # First drag: define bounding box
+                        x1, y1 = min(sx, x), min(sy, y)
+                        x2, y2 = max(sx, x), max(sy, y)
+                        if (x2 - x1) > 5 and (y2 - y1) > 5:
+                            _init_box[0] = (x1, y1, x2, y2)
+                            log.info(f"Box registered: {_init_box[0]}. Now drag heading arrow next.")
+                    else:
+                        # Second drag: define heading
+                        x1, y1, x2, y2 = _init_box[0]
+                        hx1, hy1 = sx, sy
+                        hx2, hy2 = x, y
+                        log.info(f"Heading registered: from ({hx1},{hy1}) to ({hx2},{hy2}). Sending box_click command.")
+                        try:
+                            cmd_queue.put_nowait(f"box_click:{x1},{y1},{x2},{y2}:{hx1},{hy1},{hx2},{hy2}")
+                        except Exception as e:
+                            log.warning(f"Could not enqueue box_click command: {e}")
+                        _init_box[0] = None
+                    _drag_start = None
+                    _drag_current[0] = None
+                    _need_redraw[0] = True
 
         cv2.setMouseCallback(window_name, mouse_callback)
 
         while not exit_event.is_set():
+            got_new = False
+            payload = None
             try:
-                payload = frame_queue.get(timeout=0.1)
+                # 10ms timeout to keep loop highly responsive to dragging events
+                payload = frame_queue.get(timeout=0.01)
+                if payload is not None:
+                    _last_payload[0] = payload
+                    got_new = True
             except queue.Empty:
-                # No new frame — still pump the GUI event loop
-                key = cv2.waitKey(1) & 0xFF
-                if _handle_key(key):
-                    break
-                continue
+                pass
             except (EOFError, ConnectionError, KeyboardInterrupt):
                 log.info("IPC channel closed. Exiting.")
                 break
 
-            if payload is None:
+            if got_new and payload is None:
                 log.info("Received stop sentinel. Exiting.")
                 break
 
-            frame, detections = payload
+            if got_new or _need_redraw[0]:
+                _need_redraw[0] = False
+                if _last_payload[0] is not None:
+                    frame_orig, detections = _last_payload[0]
+                    frame = frame_orig.copy() # Make a copy to overlay drawings dynamically
 
-            # Draw masks (polygons) on the overlay first
-            overlay = frame.copy()
-            has_masks = False
-            for det in detections:
-                if det.get("class_name") == "path":
-                    continue
-                polygon = det.get("polygon")
-                if polygon:
-                    has_masks = True
-                    import numpy as np
-                    pts = np.array(polygon, dtype=np.int32)
-                    color = _get_class_color(det.get("class_name", "?"))
-                    cv2.fillPoly(overlay, [pts], color)
+                    # Draw masks (polygons) on the overlay first
+                    overlay = frame.copy()
+                    has_masks = False
+                    for det in detections:
+                        if det.get("class_name") == "path":
+                            continue
+                        polygon = det.get("polygon")
+                        if polygon:
+                            has_masks = True
+                            import numpy as np
+                            pts = np.array(polygon, dtype=np.int32)
+                            color = _get_class_color(det.get("class_name", "?"))
+                            cv2.fillPoly(overlay, [pts], color)
 
-            # Blend mask overlay into the frame if any masks were drawn
-            if has_masks:
-                cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+                    # Blend mask overlay into the frame if any masks were drawn
+                    if has_masks:
+                        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
-            # Draw bounding boxes and text labels on top (opaque)
-            for det in detections:
-                if det.get("class_name") == "path":
-                    continue
-                x = det.get("x", 0)
-                y = det.get("y", 0)
-                w = det.get("w", 0)
-                h = det.get("h", 0)
-                class_name = det.get("class_name", "?")
-                confidence = det.get("confidence", 0.0)
-                
-                color = _get_class_color(class_name)
-                label = f"{class_name} {confidence:.2f}"
-                
-                # Draw bounding box
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                
-                # Draw a nice background box for text label to make it readable
-                (lbl_w, lbl_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                lbl_y_offset = max(y, lbl_h + baseline + 4)
-                cv2.rectangle(frame, (x, lbl_y_offset - lbl_h - baseline - 2), (x + lbl_w, lbl_y_offset), color, cv2.FILLED)
-                
-                # Draw white text on class color background
-                cv2.putText(
-                    frame,
-                    label,
-                    (x, lbl_y_offset - baseline - 1),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
+                    # Draw bounding boxes and text labels on top (opaque)
+                    for det in detections:
+                        if det.get("class_name") == "path":
+                            continue
+                        x = det.get("x", 0)
+                        y = det.get("y", 0)
+                        w = det.get("w", 0)
+                        h = det.get("h", 0)
+                        class_name = det.get("class_name", "?")
+                        confidence = det.get("confidence", 0.0)
 
-            # Draw path waypoints if present
-            path_det = next((d for d in detections if d.get("class_name") == "path"), None)
-            if path_det and path_det.get("points"):
-                import numpy as np
-                pts = np.array(path_det["points"], dtype=np.int32)
-                cv2.polylines(frame, [pts], isClosed=False, color=(0, 255, 0), thickness=3)
-                for pt in path_det["points"]:
-                    cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
+                        color = _get_class_color(class_name)
+                        label = f"{class_name} {confidence:.2f}"
 
-            try:
-                cv2.imshow(window_name, frame)
-                error_count = 0
-            except Exception as e:
-                error_count += 1
-                log.error(f"Failed to display frame ({error_count}/{max_errors}): {e}")
-                if error_count >= max_errors:
-                    log.critical("Too many display errors. Exiting.")
-                    break
+                        # Draw bounding box
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+                        # Draw a nice background box for text label to make it readable
+                        (lbl_w, lbl_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                        lbl_y_offset = max(y, lbl_h + baseline + 4)
+                        cv2.rectangle(frame, (x, lbl_y_offset - lbl_h - baseline - 2), (x + lbl_w, lbl_y_offset), color, cv2.FILLED)
+
+                        # Draw white text on class color background
+                        cv2.putText(
+                            frame,
+                            label,
+                            (x, lbl_y_offset - baseline - 1),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                        # Draw heading arrow: centroid → live PCA tip
+                        heading = det.get("heading")
+                        if heading is not None:
+                            cx = det.get("cx", x + w // 2)
+                            cy = det.get("cy", y + h // 2)
+                            hx, hy = int(heading[0]), int(heading[1])
+                            cv2.arrowedLine(frame, (cx, cy), (hx, hy), (255, 255, 255), 5, cv2.LINE_AA, tipLength=0.25)
+                            cv2.arrowedLine(frame, (cx, cy), (hx, hy), color, 3, cv2.LINE_AA, tipLength=0.25)
+                            cv2.circle(frame, (hx, hy), 5, (255, 255, 255), -1)
+                            cv2.circle(frame, (hx, hy), 4, color, -1)
+
+                    # Draw path waypoints if present
+                    path_det = next((d for d in detections if d.get("class_name") == "path"), None)
+                    if path_det and path_det.get("points"):
+                        import numpy as np
+                        pts = np.array(path_det["points"], dtype=np.int32)
+                        cv2.polylines(frame, [pts], isClosed=False, color=(0, 255, 0), thickness=3)
+                        for pt in path_det["points"]:
+                            cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
+
+                    # Draw visual guidance for box/heading initialization
+                    if _init_box[0] is not None:
+                        bx1, by1, bx2, by2 = _init_box[0]
+                        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 229, 0), 2)
+                        cv2.putText(
+                            frame,
+                            "Box Set. Drag heading arrow next.",
+                            (bx1, max(by1 - 10, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 229, 0),
+                            1,
+                            cv2.LINE_AA,
+                        )
+
+                    if _drag_start is not None and _drag_current[0] is not None:
+                        sx, sy = _drag_start
+                        ex, ey = _drag_current[0]
+                        if _init_box[0] is None:
+                            # Drawing box
+                            cv2.rectangle(frame, (sx, sy), (ex, ey), (255, 229, 0), 2)
+                        else:
+                            # Drawing heading arrow
+                            cv2.arrowedLine(frame, (sx, sy), (ex, ey), (0, 0, 0), 4, cv2.LINE_AA, tipLength=0.2)
+                            cv2.arrowedLine(frame, (sx, sy), (ex, ey), (0, 220, 255), 2, cv2.LINE_AA, tipLength=0.2)
+                            cv2.circle(frame, (sx, sy), 5, (0, 220, 255), -1)
+
+                    # Draw bottom instruction banner if any draft detections are active
+                    has_drafts = any("(draft)" in det.get("class_name", "") for det in detections)
+                    if has_drafts:
+                        h_f, w_f = frame.shape[:2]
+                        overlay_banner = frame.copy()
+                        cv2.rectangle(overlay_banner, (0, h_f - 35), (w_f, h_f), (0, 0, 0), cv2.FILLED)
+                        cv2.addWeighted(overlay_banner, 0.6, frame, 0.4, 0, frame)
+                        cv2.putText(
+                            frame,
+                            "PRESS ENTER/SPACE TO CONFIRM TARGETS & START LIVE TRACKING",
+                            (20, h_f - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 255, 0),
+                            1,
+                            cv2.LINE_AA
+                        )
+
+                    try:
+                        cv2.imshow(window_name, frame)
+                        error_count = 0
+                    except Exception as e:
+                        error_count += 1
+                        log.error(f"Failed to display frame ({error_count}/{max_errors}): {e}")
+                        if error_count >= max_errors:
+                            log.critical("Too many display errors. Exiting.")
+                            break
 
             try:
                 key = cv2.waitKey(1) & 0xFF
@@ -449,13 +549,39 @@ class PreviewManager:
             try:
                 if cmd.startswith("click:"):
                     try:
-                        _, coords = cmd.split(":", 1)
-                        x_str, y_str = coords.split(",", 1)
-                        x, y = int(x_str), int(y_str)
+                        # New format:    click:x1,y1:x2,y2  (press → release)
+                        # Legacy format: click:x,y           (single click)
+                        payload = cmd[len("click:"):]
+                        segments = payload.split(":")   # ["x1,y1"] or ["x1,y1", "x2,y2"]
+                        x1_str, y1_str = segments[0].split(",", 1)
+                        cx, cy = int(x1_str), int(y1_str)
+                        if len(segments) >= 2:
+                            x2_str, y2_str = segments[1].split(",", 1)
+                            hx, hy = int(x2_str), int(y2_str)
+                        else:
+                            hx, hy = cx, cy  # legacy: no drag, heading = click point
                         if hasattr(self._detector, "set_click_target"):
-                            self._detector.set_click_target(x, y)
+                            self._detector.set_click_target(cx, cy, heading_x=hx, heading_y=hy)
                     except Exception as e:
                         logger.error(f"Failed to parse click command '{cmd}': {e}")
+
+                elif cmd.startswith("box_click:"):
+                    try:
+                        # Format: box_click:x1,y1,x2,y2:hx1,hy1,hx2,hy2
+                        payload = cmd[len("box_click:"):]
+                        segments = payload.split(":")  # ["x1,y1,x2,y2", "hx1,hy1,hx2,hy2"]
+                        box_coords = [int(v) for v in segments[0].split(",")]
+                        x1, y1, x2, y2 = box_coords
+                        heading_coords = [int(v) for v in segments[1].split(",")]
+                        hx1, hy1, hx2, hy2 = heading_coords
+                        if hasattr(self._detector, "set_box_target"):
+                            self._detector.set_box_target(x1, y1, x2, y2, hx1, hy1, hx2, hy2)
+                    except Exception as e:
+                        logger.error(f"Failed to parse box_click command '{cmd}': {e}")
+
+                elif cmd == "start_tracking":
+                    if hasattr(self._detector, "start_tracking"):
+                        self._detector.start_tracking()
 
                 elif cmd == "clear_tracked":
                     if hasattr(self._detector, "clear_tracked_objects"):

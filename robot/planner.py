@@ -34,6 +34,26 @@ from .commands import Command
 
 logger = logging.getLogger(__name__)
 
+# ── Direction mapping ────────────────────────────────────────────────────────
+# Maps (dc_sign, dr_sign) → Command, where:
+#   dc = column delta: +1 = object moves right in image, -1 = left
+#   dr = row    delta: +1 = object moves down  in image, -1 = up
+#
+# TUNING: if the robot turns/drives the wrong way, swap Command values here.
+# Examples:
+#   Camera faces the scene from above, robot faces "up" in image:
+#     (+1, 0) → RIGHT, (-1, 0) → LEFT, (0, +1) → BACKWARD, (0, -1) → FORWARD  ← DEFAULT
+#   Camera rotated 90° clockwise:
+#     (+1, 0) → BACKWARD, (-1, 0) → FORWARD, (0, +1) → LEFT,  (0, -1) → RIGHT
+DIRECTION_MAP = {
+    (+1,  0): Command.RIGHT,
+    (-1,  0): Command.LEFT,
+    ( 0, +1): Command.BACKWARD,
+    ( 0, -1): Command.FORWARD,
+}
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 
 class Planner:
     """
@@ -198,10 +218,26 @@ class Planner:
     # Extension point
     # ------------------------------------------------------------------
 
-    def _resolve_coordinate(self, pos: Any, state: dict) -> tuple[int, int] | None:
+    def _resolve_coordinate(
+        self,
+        pos: Any,
+        state: dict,
+        use_heading: bool = False,
+    ) -> "tuple[int, int] | None":
+        """Resolve *pos* to pixel (x, y).
+
+        Parameters
+        ----------
+        use_heading:
+            When True and *pos* is an ``object_N`` string, return the original
+            click coordinate (heading/destination) recorded for that object
+            rather than its current centroid.  Use this for the *to_pos* arg
+            so the path ends at the user-intended target point, not the object
+            centre.
+        """
         if isinstance(pos, tuple) and len(pos) == 2:
             return int(pos[0]), int(pos[1])
-        
+
         if isinstance(pos, dict):
             if "cx" in pos and "cy" in pos:
                 return int(pos["cx"]), int(pos["cy"])
@@ -211,12 +247,36 @@ class Planner:
                 idx = pos.get("instance", 0)
                 if idx < len(dets):
                     return int(dets[idx]["cx"]), int(dets[idx]["cy"])
-                    
+
         if isinstance(pos, str):
+            # Check for click heading if this is being used as an endpoint
+            if use_heading and pos.startswith("object_"):
+                # First check if the assessed state has the dynamic heading
+                dets = state.get("objects_by_class", {}).get(pos, [])
+                if dets and "heading" in dets[0]:
+                    heading = dets[0]["heading"]
+                    logger.info(
+                        f"Resolved {pos!r} to_pos via dynamic heading: {heading}"
+                    )
+                    return int(heading[0]), int(heading[1])
+
+                try:
+                    obj_id = int(pos.split("_", 1)[1])
+                    detector = getattr(self._evaluator, "_detector", None)
+                    if detector and hasattr(detector, "get_click_heading"):
+                        heading = detector.get_click_heading(obj_id)
+                        if heading is not None:
+                            logger.info(
+                                f"Resolved {pos!r} to_pos via click heading fallback: {heading}"
+                            )
+                            return heading
+                except (ValueError, IndexError):
+                    pass
+
             dets = state.get("objects_by_class", {}).get(pos, [])
             if dets:
                 return int(dets[0]["cx"]), int(dets[0]["cy"])
-                
+
         return None
 
     def _compute_path(self, from_pos: Any, to_pos: Any) -> list[Command]:
@@ -224,10 +284,13 @@ class Planner:
         detections = state.get("detections", [])
 
         # 1. Resolve coordinates
-        p1 = self._resolve_coordinate(from_pos, state)
-        p2 = self._resolve_coordinate(to_pos, state)
+        # from_pos → centroid of the object (where the robot starts)
+        # to_pos   → click heading if available (where the user pointed), else centroid
+        p1 = self._resolve_coordinate(from_pos, state, use_heading=False)
+        p2 = self._resolve_coordinate(to_pos,   state, use_heading=True)
 
         if not p1 or not p2:
+
             logger.warning(f"Could not resolve path coordinates: from_pos={from_pos!r} -> {p1!r}, to_pos={to_pos!r} -> {p2!r}")
             return []
 
@@ -331,22 +394,24 @@ class Planner:
                 wp_y = int((r + 0.5) * cell_h)
                 waypoints.append([wp_x, wp_y])
 
-            # Translate step-by-step path grid offsets to Command directions
+            # Translate step-by-step grid transitions → Commands.
+            # For diagonal A* steps only one command is emitted (dominant axis).
+            # The goal cell itself generates no command — only the transition *into* it does.
             for i in range(len(path_cells) - 1):
                 r, c = path_cells[i]
-                nr, nc = path_cells[i+1]
+                nr, nc = path_cells[i + 1]
 
-                # Horizontal
-                if nc > c:
-                    commands.append(Command.RIGHT)
-                elif nc < c:
-                    commands.append(Command.LEFT)
+                dc = nc - c   # column delta (+right, -left)
+                dr = nr - r   # row    delta (+down/backward, -up/forward)
 
-                # Vertical
-                if nr > r:
-                    commands.append(Command.BACKWARD)
-                elif nr < r:
-                    commands.append(Command.FORWARD)
+                # Pick dominant axis (break ties with horizontal)
+                if abs(dc) >= abs(dr):
+                    cmd = DIRECTION_MAP.get((+1 if dc > 0 else -1, 0))
+                else:
+                    cmd = DIRECTION_MAP.get((0, +1 if dr > 0 else -1))
+
+                if cmd is not None:
+                    commands.append(cmd)
         else:
             logger.warning("No path found via grid A*.")
             # Set direct line fallback path

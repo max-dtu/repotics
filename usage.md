@@ -2,8 +2,10 @@
 
 ## Starting the app
 
+### Mac/Linux
 ```bash
+python -m venv .venv
 source .venv/bin/activate
-python3 main.py
+python main.py
 ```
 
