@@ -26,6 +26,7 @@ Position types
 * A dict ``{"class": "cup", "instance": 0}``
 """
 
+import heapq
 import logging
 import math
 from typing import Any, Callable
@@ -340,21 +341,20 @@ class Planner:
         grid[row2][col2] = 0
 
         # 5. A* Search
-        import heapq
         def heuristic(a, b):
             return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
         start = (row1, col1)
         goal = (row2, col2)
 
-        queue = []
-        heapq.heappush(queue, (0.0, start))
+        open_set = []
+        heapq.heappush(open_set, (0.0, start))
         came_from = {start: None}
         cost_so_far = {start: 0.0}
 
         found = False
-        while queue:
-            _, current = heapq.heappop(queue)
+        while open_set:
+            _, current = heapq.heappop(open_set)
 
             if current == goal:
                 found = True
@@ -375,7 +375,7 @@ class Planner:
                 if next_node not in cost_so_far or new_cost < cost_so_far[next_node]:
                     cost_so_far[next_node] = new_cost
                     priority = new_cost + heuristic(next_node, goal)
-                    heapq.heappush(queue, (priority, next_node))
+                    heapq.heappush(open_set, (priority, next_node))
                     came_from[next_node] = current
 
         # 6. Translate path to waypoints and Commands

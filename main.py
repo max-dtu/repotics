@@ -68,11 +68,20 @@ camera = Camera()
 robot  = Robot(detector=camera._detector, backend=_ev3_backend)
 
 BANNER = """
-    help() 
-    
+  camera.preview()                       — live window (already open)
+  camera.get_detections()                — raw detection list
+  robot.assess()                         — structured world state
+  robot.send("forward")                  — send one command
+  robot.find_path("object_0", "object_1")— plan + execute A* path
+  robot.find_path(..., execute=False)    — plan only (no movement)
+  camera.start_detection()               — restart detection pipeline
+  camera.close()                         — clean shutdown
 """
 
 if __name__ == "__main__":
     camera.start_detection(model_path="YOLO+DINOv2")
     camera.preview()
-    code.interact(banner=BANNER, local=globals())
+    try:
+        code.interact(banner=BANNER, local=globals())
+    finally:
+        camera.close()

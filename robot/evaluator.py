@@ -63,7 +63,8 @@ class Evaluator:
         Add more derived fields here as the project grows (e.g. gripper state,
         occupancy grid, distance estimates).
         """
-        detections = self._detector.get_detections()
+        # Exclude the "path" pseudo-entry injected by get_detections() for rendering.
+        detections = [d for d in self._detector.get_detections() if d.get("class_name") != "path"]
 
         objects_by_class: dict[str, list] = {}
         for det in detections:
@@ -146,5 +147,8 @@ class Evaluator:
                                for cx, cy in state["centroids"])
                 return False
         """
-        # --- STUB: replace with real goal evaluation ---
+        logger.warning(
+            f"_evaluate_goal: unhandled goal type {type(goal).__name__!r} — "
+            "stub returns False. Override _evaluate_goal or pass a callable."
+        )
         return False
