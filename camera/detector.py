@@ -412,14 +412,21 @@ class Detector:
         imgsz: int | tuple | None = None,
     ) -> list[dict]:
         """
-        Runs object detection/segmentation using YOLOv8 and/or SAM models.
+        Runs object detection/segmentation.
         Supports:
+          - 'AUTO'                              — fully automatic color+shape detector
           - YOLOv8 object detection (e.g., 'yolov8n.pt')
           - YOLOv8 segmentation (e.g., 'yolov8n-seg.pt')
           - SAM automatic segmentation (e.g., 'mobile_sam.pt', 'sam_b.pt')
           - YOLOv8 detection + SAM prompted segmentation (e.g., 'yolov8n.pt+mobile_sam.pt')
-          - SAM 2 + DINOv2 visual tracking ('SAM2+DINOv2')
+          - YOLO + DINOv2 visual tracking ('YOLO+DINOv2')
         """
+        if model_path == "ROBOFLOW":
+            return self._run_roboflow_detection(frame)
+
+        if model_path == "AUTO":
+            return self._run_auto_detection(frame)
+
         if model_path in ("YOLO+DINOv2", "YOLO+DINO", "SAM2+DINOv2"):
             import torch
             import torchvision.transforms.functional as TF
@@ -1027,5 +1034,273 @@ class Detector:
                             "confidence": 1.0,
                             "polygon": polygon.tolist(),
                         })
+
+        return detections
+
+    def _run_roboflow_detection(self, frame) -> list[dict]:
+        """
+        Sends the current frame to a Roboflow workflow and converts the
+        response into the standard detection dict format used by the rest
+        of the pipeline.
+
+        Calls are throttled to THROTTLE_SEC seconds apart; the most recent
+        result is returned for frames that arrive between API calls.
+        """
+        import base64
+        import time
+        import cv2
+
+        THROTTLE_SEC   = 0.20   # max ~5 API calls/sec
+        RF_WORKSPACE   = "kals-workspace-cboi3"
+        RF_WORKFLOW    = "kal-v6-logic"
+        RF_API_KEY     = "xLNYMBA3PKzA5RlCed0E"
+        RF_API_URL     = "https://serverless.roboflow.com"
+        SEND_MAX_DIM   = 1280   # resize before upload to keep payload small
+
+        # Return cached result within the throttle window
+        now = time.monotonic()
+        if now - getattr(self, "_rf_last_call", 0.0) < THROTTLE_SEC:
+            return getattr(self, "_rf_last_result", [])
+        self._rf_last_call = now  # type: ignore[attr-defined]
+
+        # Lazy-init client
+        if getattr(self, "_roboflow_client", None) is None:
+            from inference_sdk import InferenceHTTPClient
+            self._roboflow_client = InferenceHTTPClient(  # type: ignore[attr-defined]
+                api_url=RF_API_URL,
+                api_key=RF_API_KEY,
+            )
+            logger.info("Roboflow InferenceHTTPClient initialised.")
+
+        # Optionally downscale to keep upload size reasonable
+        h_orig, w_orig = frame.shape[:2]
+        if max(h_orig, w_orig) > SEND_MAX_DIM:
+            scale     = SEND_MAX_DIM / max(h_orig, w_orig)
+            send_w    = int(w_orig * scale)
+            send_h    = int(h_orig * scale)
+            frame_out = cv2.resize(frame, (send_w, send_h))
+            scale_x   = w_orig / send_w
+            scale_y   = h_orig / send_h
+        else:
+            frame_out = frame
+            scale_x = scale_y = 1.0
+
+        _, buf = cv2.imencode(".jpg", frame_out, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        b64    = base64.b64encode(buf).decode("utf-8")
+
+        try:
+            raw = self._roboflow_client.run_workflow(
+                workspace_name=RF_WORKSPACE,
+                workflow_id=RF_WORKFLOW,
+                images={"image": b64},
+                use_cache=True,
+            )
+        except Exception as exc:
+            logger.warning("Roboflow API call failed: %s", exc)
+            return getattr(self, "_rf_last_result", [])
+
+        # Log the raw response shape once so it's easy to debug
+        if not getattr(self, "_rf_logged", False):
+            logger.info("Roboflow raw result: %s", raw)
+            self._rf_logged = True  # type: ignore[attr-defined]
+
+        def _find_preds(node):
+            """Recursively locate the first list of prediction dicts."""
+            if isinstance(node, list):
+                if node and isinstance(node[0], dict) and "class" in node[0]:
+                    return node
+                for item in node:
+                    found = _find_preds(item)
+                    if found is not None:
+                        return found
+            if isinstance(node, dict):
+                for key in ("predictions", "output", "detections"):
+                    val = node.get(key)
+                    if isinstance(val, list) and val and "class" in val[0]:
+                        return val
+                    if isinstance(val, dict):
+                        found = _find_preds(val)
+                        if found is not None:
+                            return found
+                for val in node.values():
+                    found = _find_preds(val)
+                    if found is not None:
+                        return found
+            return None
+
+        preds = _find_preds(raw) or []
+        detections: list[dict] = []
+        for p in preds:
+            # Roboflow bbox coords are centre-based; convert to top-left origin
+            cx = float(p.get("x", 0)) * scale_x
+            cy = float(p.get("y", 0)) * scale_y
+            bw = float(p.get("width",  0)) * scale_x
+            bh = float(p.get("height", 0)) * scale_y
+            detections.append({
+                "x":          int(cx - bw / 2),
+                "y":          int(cy - bh / 2),
+                "w":          int(bw),
+                "h":          int(bh),
+                "cx":         int(cx),
+                "cy":         int(cy),
+                "class_name": p.get("class", "unknown"),
+                "confidence": float(p.get("confidence", 0.0)),
+            })
+
+        self._rf_last_result = detections  # type: ignore[attr-defined]
+        return detections
+
+    def _run_auto_detection(self, frame) -> list[dict]:
+        """
+        Fully automatic detector for the game scenario (top-down camera):
+          - orange_ball  : HSV orange mask → circular contour
+          - white_ball   : HSV white/bright mask → circular contour
+          - big_goal     : largest 4-sided ~square contour by area
+          - small_goal   : second-largest 4-sided ~square contour
+          - robot        : largest remaining contour after above are claimed
+
+        All tunable constants are grouped at the top — adjust them for your
+        specific lighting, field surface, and object sizes.
+        """
+        import cv2
+        import math
+        import numpy as np
+
+        # ── Tunable constants ──────────────────────────────────────────────────
+        # HSV ranges for colour masking (OpenCV: H 0-179, S 0-255, V 0-255)
+        ORANGE_LOWER = np.array([  5, 150, 150])
+        ORANGE_UPPER = np.array([ 25, 255, 255])
+        WHITE_LOWER  = np.array([  0,   0, 200])
+        WHITE_UPPER  = np.array([180,  50, 255])
+        # Red wraps around 0 in HSV — two ranges needed
+        RED_LOWER1   = np.array([  0, 120,  70])
+        RED_UPPER1   = np.array([ 10, 255, 255])
+        RED_LOWER2   = np.array([165, 120,  70])
+        RED_UPPER2   = np.array([179, 255, 255])
+        # Minimum blob area (px²) for a contour to count as a ball
+        BALL_MIN_AREA    = 200
+        # Circularity threshold: 1.0 = perfect circle; 0.7 tolerates noise well
+        BALL_CIRCULARITY = 0.70
+        # Minimum red-blob area (px²) for a contour to count as a goal marker
+        RED_MIN_AREA   = 300
+        # Minimum area (px²) for the largest contour to count as the robot
+        ROBOT_MIN_AREA = 800
+        # ──────────────────────────────────────────────────────────────────────
+
+        hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h_f, w_f = frame.shape[:2]
+        detections: list[dict] = []
+        claimed = np.zeros((h_f, w_f), dtype=np.uint8)
+
+        def _build_det(cx, cy, w, h, class_name, confidence, polygon=None):
+            det = {
+                "x": int(cx - w / 2), "y": int(cy - h / 2),
+                "w": int(w), "h": int(h),
+                "cx": int(cx), "cy": int(cy),
+                "class_name": class_name,
+                "confidence": float(confidence),
+            }
+            if polygon is not None:
+                det["polygon"] = polygon
+            return det
+
+        def _find_best_circle(mask):
+            """Largest circular blob in mask; returns (cx, cy, w, h, polygon) or None."""
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            clean  = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+            clean  = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            best = None
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < BALL_MIN_AREA:
+                    continue
+                perim = cv2.arcLength(c, True)
+                if perim < 1:
+                    continue
+                if (4 * math.pi * area / (perim * perim)) < BALL_CIRCULARITY:
+                    continue
+                if best is None or area > cv2.contourArea(best):
+                    best = c
+            if best is None:
+                return None
+            (bx, by), radius = cv2.minEnclosingCircle(best)
+            d    = int(radius * 2)
+            poly = best.reshape(-1, 2).tolist()
+            return float(bx), float(by), d, d, poly
+
+        # ── Orange ball ────────────────────────────────────────────────────────
+        result = _find_best_circle(cv2.inRange(hsv, ORANGE_LOWER, ORANGE_UPPER))
+        if result:
+            cx, cy, w, h, poly = result
+            detections.append(_build_det(cx, cy, w, h, "orange_ball", 0.95, poly))
+            cv2.circle(claimed, (int(cx), int(cy)), max(w, h) // 2 + 8, 255, -1)
+
+        # ── White ball (excluding already-claimed region) ──────────────────────
+        white_mask = cv2.bitwise_and(
+            cv2.inRange(hsv, WHITE_LOWER, WHITE_UPPER),
+            cv2.bitwise_not(claimed),
+        )
+        result = _find_best_circle(white_mask)
+        if result:
+            cx, cy, w, h, poly = result
+            detections.append(_build_det(cx, cy, w, h, "white_ball", 0.95, poly))
+            cv2.circle(claimed, (int(cx), int(cy)), max(w, h) // 2 + 8, 255, -1)
+
+        # ── Goals (red stripe marker) ─────────────────────────────────────────
+        # Goals are cardboard/wood pieces with a distinctive red stripe.
+        # Red wraps around 0° in HSV, so combine two sub-ranges.
+        red_mask = cv2.bitwise_or(
+            cv2.inRange(hsv, RED_LOWER1, RED_UPPER1),
+            cv2.inRange(hsv, RED_LOWER2, RED_UPPER2),
+        )
+        red_mask = cv2.bitwise_and(red_mask, cv2.bitwise_not(claimed))
+        rk = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, rk)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN,  rk)
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        goal_candidates = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < RED_MIN_AREA:
+                continue
+            goal_candidates.append((area, c))
+
+        goal_candidates.sort(key=lambda t: t[0], reverse=True)
+        for i, (_, c) in enumerate(goal_candidates[:2]):
+            gx, gy, gw, gh = cv2.boundingRect(c)
+            cx, cy = gx + gw / 2, gy + gh / 2
+            poly   = c.reshape(-1, 2).tolist()
+            name   = "big_goal" if i == 0 else "small_goal"
+            detections.append(_build_det(cx, cy, gw, gh, name, 0.90, poly))
+            claimed[gy:gy + gh, gx:gx + gw] = 255
+
+        # ── Robot: largest remaining Canny contour ────────────────────────────
+        gray      = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges     = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 30, 100)
+        remaining = cv2.bitwise_and(edges, cv2.bitwise_not(claimed))
+        contours, _ = cv2.findContours(remaining, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        robot_c = None
+        for c in contours:
+            if cv2.contourArea(c) < ROBOT_MIN_AREA:
+                continue
+            if robot_c is None or cv2.contourArea(c) > cv2.contourArea(robot_c):
+                robot_c = c
+
+        if robot_c is not None:
+            rect = cv2.minAreaRect(robot_c)
+            (rx, ry), (rw, rh), angle_deg = rect
+            poly = robot_c.reshape(-1, 2).tolist()
+            det  = _build_det(rx, ry, rw, rh, "robot", 0.90, poly)
+            # Heading: long axis of the robot's bounding box → unit vector
+            if rw < rh:
+                angle_deg += 90
+            angle_rad = math.radians(angle_deg)
+            det["heading"] = [
+                int(rx + math.cos(angle_rad) * max(rw, rh) * 0.7),
+                int(ry + math.sin(angle_rad) * max(rw, rh) * 0.7),
+            ]
+            detections.append(det)
 
         return detections
