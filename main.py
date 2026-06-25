@@ -21,7 +21,8 @@ def _ev3_backend(command: Command) -> None:
     for attempt in range(2):
         try:
             if _sock is None:
-                _sock = socket.create_connection((EV3_HOST, EV3_PORT), timeout=3)
+                _sock = socket.create_connection(
+                    (EV3_HOST, EV3_PORT), timeout=3)
                 logging.getLogger(__name__).info(
                     "Connected to EV3 at %s:%d", EV3_HOST, EV3_PORT)
             _sock.sendall(payload)
@@ -59,9 +60,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Class names — adjust to match your best.pt labels ───────────────────────
-BALL_CLASSES  = ("WhiteBall", "OrangeBall", "orange_ball", "white_ball")
-ROBOT_CLASS   = "Car"
-GOAL_CLASSES  = ("small_goal", "big_goal")   # preferred order (more points first)
+BALL_CLASSES = ("WhiteBall", "OrangeBall", "orange_ball", "white_ball")
+ROBOT_CLASS = "Car"
+# preferred order (more points first)
+GOAL_CLASSES = ("small_goal", "big_goal")
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -74,27 +76,118 @@ def _pick_goal(state: dict) -> str | None:
 
 
 # ── Navigation constants ─────────────────────────────────────────────────────
-_APPROACH_PX = 70   # stop when ball centroid is within this many pixels
-_PROGRESS_PX = 4    # minimum pixels toward ball per step to count as progress
+_APPROACH_PX  = 55    # stop when within this many pixels of target centroid
+_ALIGN_DEG    = 20.0  # acceptable heading error before driving forward
+_DEG_PER_TURN = 28.0  # degrees robot rotates per single turn command
+_NOISE_PX     = 8     # min displacement (px) required to trust as heading
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Field / obstacle avoidance ───────────────────────────────────────────────
+FRAME_W        = 640   # camera frame width  (px)
+FRAME_H        = 480   # camera frame height (px)
+_BORDER_MARGIN = 80    # px from edge to activate border repulsion
+_OBS_MARGIN    = 110   # px from YOLO obstacle centroid to activate repulsion
+_BORDER_W      = 1.5   # border repulsion weight vs attraction
+_OBS_W         = 2.5   # obstacle repulsion weight vs attraction
+
+# Hardcoded obstacles (cx, cy, radius_px).
+# Add the cross here if YOLO does not detect it, e.g.:
+#   _FIXED_OBSTACLES = [(320, 240, 70)]  # cross at frame centre
+_FIXED_OBSTACLES: list[tuple[float, float, float]] = []
+# ─────────────────────────────────────────────────────────────────────────────
+
+# True  = "right" command is clockwise in the camera image
+# False = "right" is counter-clockwise
+# None  = not yet determined (calibrated on the first turn needed)
+_right_is_cw: bool | None = None
+
+
+def _steer_direction(
+    rx: float, ry: float,
+    tx: float, ty: float,
+    state: dict,
+) -> tuple[float, float]:
+    """
+    Return a normalised (dx, dy) steering direction blending:
+      - attraction toward (tx, ty)
+      - repulsion from the four field borders
+      - repulsion from YOLO-detected obstacles (non-ball / non-goal / non-robot)
+      - repulsion from hardcoded _FIXED_OBSTACLES (e.g. the cross)
+    """
+    dist = math.hypot(tx - rx, ty - ry)
+    if dist < 1e-3:
+        return (0.0, 0.0)
+
+    ax = (tx - rx) / dist
+    ay = (ty - ry) / dist
+
+    # Border repulsion
+    bx, by = 0.0, 0.0
+    if rx < _BORDER_MARGIN:
+        bx += (_BORDER_MARGIN - rx) / _BORDER_MARGIN
+    if rx > FRAME_W - _BORDER_MARGIN:
+        bx -= (rx - (FRAME_W - _BORDER_MARGIN)) / _BORDER_MARGIN
+    if ry < _BORDER_MARGIN:
+        by += (_BORDER_MARGIN - ry) / _BORDER_MARGIN
+    if ry > FRAME_H - _BORDER_MARGIN:
+        by -= (ry - (FRAME_H - _BORDER_MARGIN)) / _BORDER_MARGIN
+
+    # YOLO obstacle repulsion (any class not recognised as ball / goal / robot)
+    known = frozenset(BALL_CLASSES) | frozenset(GOAL_CLASSES) | {ROBOT_CLASS}
+    ox, oy = 0.0, 0.0
+    for det in state.get("detections", []):
+        if det.get("class_name", "") in known:
+            continue
+        dcx, dcy = float(det["cx"]), float(det["cy"])
+        odist = math.hypot(rx - dcx, ry - dcy)
+        if 0 < odist < _OBS_MARGIN:
+            mag = (_OBS_MARGIN - odist) / _OBS_MARGIN
+            ox += (rx - dcx) / odist * mag
+            oy += (ry - dcy) / odist * mag
+
+    # Hardcoded obstacle repulsion (cross, walls, etc.)
+    for (fcx, fcy, frad) in _FIXED_OBSTACLES:
+        odist = math.hypot(rx - fcx, ry - fcy)
+        if 0 < odist < frad:
+            mag = (frad - odist) / frad
+            ox += (rx - fcx) / odist * mag
+            oy += (ry - fcy) / odist * mag
+
+    cx = ax + _BORDER_W * bx + _OBS_W * ox
+    cy = ay + _BORDER_W * by + _OBS_W * oy
+
+    cmag = math.hypot(cx, cy)
+    if cmag < 1e-6:
+        return (ax, ay)
+    return (cx / cmag, cy / cmag)
 
 
 def _drive_to(robot: Robot, tx: float, ty: float) -> bool:
     """
-    Drive to pixel target (tx, ty) without any heading math.
+    Drive to pixel target (tx, ty) using heading-aware steering.
 
-    Each iteration:
-      1. Send 'forward'.
-      2. Measure the dot-product of the displacement with the direction to
-         the target.  If the robot moved at least _PROGRESS_PX toward it,
-         keep going.  Otherwise turn right and try again next step.
-
-    No heading estimation, no dead reckoning, no sign assumptions about
-    which physical direction the turn commands rotate.
+    Sequence each iteration:
+      1. Read position, update path preview, check arrival.
+      2. Bootstrap (heading=None): drive forward once to get heading from
+         displacement.
+      3. Compute signed angular error from heading to target.
+         cross = hx*dy - hy*dx; positive → target is clockwise from heading.
+      4. Misaligned: turn first, never drive.
+         - First turn ever: probe with "right" + forward to calibrate whether
+           "right" is CW or CCW in the camera image. Stored in _right_is_cw.
+         - Subsequent turns: pick "right"/"left" from calibrated polarity and
+           dead-reckon heading by ±_DEG_PER_TURN.
+      5. Aligned: drive forward. Update heading from measured displacement.
+         Hold last heading if below noise floor.
     """
-    detector = robot._evaluator._detector
+    global _right_is_cw
+    detector  = robot._evaluator._detector
+    _TURN_RAD = math.radians(_DEG_PER_TURN)
+
+    heading: tuple[float, float] | None = None
 
     for _ in range(100):
+        # ── 1. Read position ────────────────────────────────────────────────
         state = robot.assess()
         r     = state["objects_by_class"].get(ROBOT_CLASS, [])
         if not r:
@@ -107,28 +200,86 @@ def _drive_to(robot: Robot, tx: float, ty: float) -> bool:
         if hasattr(detector, "set_current_path"):
             detector.set_current_path([[int(rx), int(ry)], [int(tx), int(ty)]])
 
-        log.info("drive_to: pos=(%.0f,%.0f)  dist=%.0fpx", rx, ry, dist)
+        log.info("drive_to: pos=(%.0f,%.0f)  dist=%.0fpx  hdg=%s",
+                 rx, ry, dist,
+                 "(%.2f,%.2f)" % heading if heading else "?")
 
         if dist < _APPROACH_PX:
             return True
 
-        # Drive forward, then measure progress toward target
-        robot.send("forward")
-
-        state2 = robot.assess()
-        r2     = state2["objects_by_class"].get(ROBOT_CLASS, [])
-        if not r2:
+        # ── 2. Bootstrap: drive forward once to get initial heading ─────────
+        if heading is None:
+            robot.send("forward")
+            s2 = robot.assess()
+            r2 = s2["objects_by_class"].get(ROBOT_CLASS, [])
+            if r2:
+                rx2, ry2 = float(r2[0]["cx"]), float(r2[0]["cy"])
+                d = math.hypot(rx2 - rx, ry2 - ry)
+                if d >= _NOISE_PX:
+                    heading = ((rx2 - rx) / d, (ry2 - ry) / d)
+                    log.info("  Bootstrap heading: (%.2f, %.2f)", *heading)
             continue
-        rx2, ry2 = float(r2[0]["cx"]), float(r2[0]["cy"])
 
-        # Dot product of displacement with direction-to-target
-        # positive and large  → moved toward target
-        # small or negative   → moving sideways or away
-        progress = ((rx2 - rx) * (tx - rx) + (ry2 - ry) * (ty - ry)) / max(dist, 1)
-        log.info("  progress=%.1fpx", progress)
+        # ── 3. Angular error using potential-field steering direction ───────
+        dx, dy    = _steer_direction(rx, ry, tx, ty, state)
+        cross     = heading[0] * dy - heading[1] * dx
+        dot       = heading[0] * dx + heading[1] * dy
+        error_deg = math.degrees(math.atan2(cross, dot))
+        log.info("  error=%.1f°", error_deg)
 
-        if progress < _PROGRESS_PX:
-            robot.send("right")   # not heading toward ball — turn and retry
+        # ── 4. Misaligned: turn first ────────────────────────────────────────
+        if abs(error_deg) > _ALIGN_DEG:
+            if _right_is_cw is None:
+                # One-time calibration: probe with "right" then forward
+                h_before = heading
+                robot.send("right")
+                sc1 = robot.assess()
+                rc1 = sc1["objects_by_class"].get(ROBOT_CLASS, [])
+                if not rc1:
+                    continue
+                rxc, ryc = float(rc1[0]["cx"]), float(rc1[0]["cy"])
+                robot.send("forward")
+                sc2 = robot.assess()
+                rc2 = sc2["objects_by_class"].get(ROBOT_CLASS, [])
+                if not rc2:
+                    continue
+                rxc2, ryc2 = float(rc2[0]["cx"]), float(rc2[0]["cy"])
+                d = math.hypot(rxc2 - rxc, ryc2 - ryc)
+                if d >= _NOISE_PX:
+                    h_after      = ((rxc2 - rxc) / d, (ryc2 - ryc) / d)
+                    cal_cross    = h_before[0] * h_after[1] - h_before[1] * h_after[0]
+                    _right_is_cw = cal_cross > 0
+                    heading      = h_after
+                    log.info("  Calibrated: right_is_cw=%s (cross=%.3f)",
+                             _right_is_cw, cal_cross)
+                continue
+
+            # Steer with calibrated polarity
+            need_cw  = error_deg > 0
+            turn_cmd = ("right" if need_cw else "left") if _right_is_cw \
+                  else ("left"  if need_cw else "right")
+            robot.send(turn_cmd)
+
+            # Dead-reckon heading: CW rotation in y-down coords
+            theta        = _TURN_RAD if need_cw else -_TURN_RAD
+            cos_t, sin_t = math.cos(theta), math.sin(theta)
+            heading = (
+                cos_t * heading[0] - sin_t * heading[1],
+                sin_t * heading[0] + cos_t * heading[1],
+            )
+            log.info("  Sent %s → est. hdg (%.2f, %.2f)", turn_cmd, *heading)
+            continue
+
+        # ── 5. Aligned: drive forward and update heading ─────────────────────
+        robot.send("forward")
+        s3 = robot.assess()
+        r3 = s3["objects_by_class"].get(ROBOT_CLASS, [])
+        if r3:
+            rx3, ry3 = float(r3[0]["cx"]), float(r3[0]["cy"])
+            d = math.hypot(rx3 - rx, ry3 - ry)
+            if d >= _NOISE_PX:
+                heading = ((rx3 - rx) / d, (ry3 - ry) / d)
+                log.info("  Heading from disp: (%.2f, %.2f)  d=%.1fpx", *heading, d)
 
     log.warning("_drive_to: max steps reached.")
     return False
@@ -147,7 +298,8 @@ def _plan_sequence(balls: list, start: tuple) -> list:
     ordered = []
     pos = start
     while remaining:
-        nearest = min(remaining, key=lambda d: math.hypot(d["cx"] - pos[0], d["cy"] - pos[1]))
+        nearest = min(remaining, key=lambda d: math.hypot(
+            d["cx"] - pos[0], d["cy"] - pos[1]))
         ordered.append(nearest)
         pos = (nearest["cx"], nearest["cy"])
         remaining.remove(nearest)
@@ -165,6 +317,9 @@ def _show_route(robot: Robot, start: tuple, balls: list) -> None:
 
 
 def run_autonomous(robot: Robot) -> None:
+    global _right_is_cw
+    _right_is_cw = None   # re-calibrate turn direction at the start of each run
+
     log.info("Waiting 3 s for camera to warm up...")
     time.sleep(3.0)
 
@@ -199,49 +354,63 @@ def run_autonomous(robot: Robot) -> None:
             state = robot.assess()
             robot_dets = state["objects_by_class"].get(ROBOT_CLASS, [])
             if robot_dets:
-                robot_pos = (float(robot_dets[0]["cx"]), float(robot_dets[0]["cy"]))
+                robot_pos = (float(robot_dets[0]["cx"]), float(
+                    robot_dets[0]["cy"]))
                 _show_route(robot, robot_pos, sequence[i:])
 
             target = (float(ball["cx"]), float(ball["cy"]))
-            log.info("Ball %d/%d at (%.0f, %.0f)", i + 1, len(sequence), *target)
+            log.info("Ball %d/%d at (%.0f, %.0f)",
+                     i + 1, len(sequence), *target)
 
             # ── 1. Drive to ball ─────────────────────────────────────────────
             if not _drive_to(robot, *target):
                 log.warning("Could not reach ball %d — skipping.", i + 1)
                 continue
 
-            # ── 2. Grab ──────────────────────────────────────────────────────
+            # ── 2. Nudge forward so ball seats inside gripper, then close ────
+            log.info("Nudging into ball...")
+            robot.send("forward")
+            robot.send("forward")
             log.info("Closing gripper...")
             robot.send("close_gripper")
-            time.sleep(0.5)
 
-            # ── 3. Drive to goal ─────────────────────────────────────────────
-            state = robot.assess()
-            goal = _pick_goal(state)
-            if goal is None:
-                log.warning("No goal visible — opening gripper.")
+            # ── 3. Find goal — spin until one is visible ──────────────────────
+            log.info("Looking for goal...")
+            goal_pos = None
+            for _ in range(24):          # up to ~360° of search
+                state = robot.assess()
+                goal_cls = _pick_goal(state)
+                if goal_cls:
+                    dets = state["objects_by_class"].get(goal_cls, [])
+                    if dets:
+                        goal_pos = (float(dets[0]["cx"]), float(dets[0]["cy"]))
+                        log.info("Goal found: %s at (%.0f, %.0f)",
+                                 goal_cls, *goal_pos)
+                        break
+                robot.send("right")
+
+            if goal_pos is None:
+                log.warning("Goal not found — dropping ball and continuing.")
                 robot.send("open_gripper")
-                time.sleep(0.5)
                 continue
 
-            log.info("Depositing at %s...", goal)
-            state      = robot.assess()
-            goal_dets  = state["objects_by_class"].get(goal, [])
-            if goal_dets:
-                _drive_to(robot, float(goal_dets[0]["cx"]), float(goal_dets[0]["cy"]))
+            # ── 4. Drive to goal ──────────────────────────────────────────────
+            _drive_to(robot, *goal_pos)
 
-            # ── 4. Deposit ───────────────────────────────────────────────────
+            # ── 5. Deposit and back away ──────────────────────────────────────
+            log.info("Depositing ball.")
             robot.send("open_gripper")
-            time.sleep(0.5)
+            robot.send("backward")
+            robot.send("backward")
 
         # Loop back: replan from new position with any remaining/new balls
 
 
 if __name__ == "__main__":
     camera = Camera()
-    robot  = Robot(detector=camera._detector, backend=_ev3_backend)
+    robot = Robot(detector=camera._detector, backend=_ev3_backend)
 
-    camera.start_detection(model_path="best.pt", confidence=0.30)
+    camera.start_detection(model_path="best.pt", confidence=0.15)
     camera.preview()
 
     try:
