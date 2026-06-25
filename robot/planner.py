@@ -319,13 +319,20 @@ class Planner:
         row2 = min(grid_h - 1, max(0, int(y2 / cell_h)))
 
         # 4. Mark obstacle cells
-        # Obstacles are any detections whose class_name is NOT from_pos and NOT to_pos
+        # Skip: path class, class-name matches from_pos/to_pos (string callers),
+        # and any detection whose bounding box contains the start or goal pixel
+        # (handles tuple callers where from_pos/to_pos are coordinates, not class names).
         for det in detections:
             cls_name = det.get("class_name")
             if cls_name == "path" or cls_name == from_pos or cls_name == to_pos:
                 continue
 
             ox, oy, ow, oh = det.get("x", 0), det.get("y", 0), det.get("w", 0), det.get("h", 0)
+            if ox <= x1 <= ox + ow and oy <= y1 <= oy + oh:
+                continue  # this detection IS the source object
+            if ox <= x2 <= ox + ow and oy <= y2 <= oy + oh:
+                continue  # this detection IS the target object
+
             margin = 10
             bx1 = max(0, int((ox - margin) / cell_w))
             by1 = max(0, int((oy - margin) / cell_h))

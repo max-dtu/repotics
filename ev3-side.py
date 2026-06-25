@@ -14,7 +14,7 @@ HOST            = "0.0.0.0"   # Listen on all interfaces
 PORT            = 9999         # Must match the port used by the MacBook
 DRIVE_SPEED     = -400         # Motor speed for driving (deg/s). Negate if forward drives backward.
 DRIVE_DURATION  = 0.3          # Seconds each drive command runs
-TURN_SPEED      = 300          # Motor speed for turning (deg/s)
+TURN_SPEED      = -300         # Motor speed for turning (deg/s). Negative to match DRIVE_SPEED convention (positive = backward).
 TURN_DURATION   = 0.2          # Seconds each turn command runs. Reduce to turn less per command.
 GRIPPER_SPEED   = 200          # Motor speed for gripper (deg/s)
 GRIPPER_OPEN_POS  = 120        # Gripper open position relative to close (deg)

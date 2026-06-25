@@ -1,4 +1,5 @@
 import logging
+import math
 import socket
 import sys
 import time
@@ -72,15 +73,40 @@ def _pick_goal(state: dict) -> str | None:
     return None
 
 
-def _any_balls(state: dict) -> bool:
-    return any(cls in state["objects_by_class"] for cls in BALL_CLASSES)
+def _all_balls(state: dict) -> list:
+    return [d for cls in BALL_CLASSES for d in state["objects_by_class"].get(cls, [])]
+
+
+def _plan_sequence(balls: list, start: tuple) -> list:
+    """
+    Greedy nearest-neighbour ordering of all balls from start position.
+    Returns a new list ordered closest-first.
+    """
+    remaining = list(balls)
+    ordered = []
+    pos = start
+    while remaining:
+        nearest = min(remaining, key=lambda d: math.hypot(d["cx"] - pos[0], d["cy"] - pos[1]))
+        ordered.append(nearest)
+        pos = (nearest["cx"], nearest["cy"])
+        remaining.remove(nearest)
+    return ordered
+
+
+def _show_route(robot: Robot, start: tuple, balls: list) -> None:
+    """Draw the full planned route through all remaining balls in the preview."""
+    pts = [[int(start[0]), int(start[1])]]
+    for b in balls:
+        pts.append([int(b["cx"]), int(b["cy"])])
+    detector = robot._evaluator._detector
+    if hasattr(detector, "set_current_path"):
+        detector.set_current_path(pts)
 
 
 def run_autonomous(robot: Robot) -> None:
     log.info("Waiting 3 s for camera to warm up...")
     time.sleep(3.0)
 
-    # Reset gripper to open so we're ready to grab
     robot.send("open_gripper")
     time.sleep(0.5)
 
@@ -88,43 +114,64 @@ def run_autonomous(robot: Robot) -> None:
 
     while True:
         state = robot.assess()
+        balls = _all_balls(state)
 
-        if not _any_balls(state):
+        if not balls:
             log.info("No balls detected — mission complete!")
             break
 
-        # ── 1. Drive to nearest ball ────────────────────────────────────────
-        log.info("Navigating to nearest ball...")
-        path = robot.go_to_nearest_ball(
-            ball_classes=BALL_CLASSES,
-            robot_class=ROBOT_CLASS,
-        )
-        if not path:
-            log.warning("Could not plan path to ball — retrying in 1 s...")
-            time.sleep(1.0)
+        robot_dets = state["objects_by_class"].get(ROBOT_CLASS, [])
+        if not robot_dets:
+            time.sleep(0.2)
             continue
 
-        # ── 2. Grab it ──────────────────────────────────────────────────────
-        log.info("Closing gripper...")
-        robot.send("close_gripper")
-        time.sleep(0.5)
+        robot_pos = (float(robot_dets[0]["cx"]), float(robot_dets[0]["cy"]))
 
-        # ── 3. Drive to goal ────────────────────────────────────────────────
-        state = robot.assess()
-        goal = _pick_goal(state)
-        if goal is None:
-            log.warning("No goal in view — opening gripper and retrying...")
+        # ── Plan one route through all balls, closest first ─────────────────
+        sequence = _plan_sequence(balls, robot_pos)
+        log.info("Route planned: %d balls", len(sequence))
+        _show_route(robot, robot_pos, sequence)
+
+        # ── Follow the route ─────────────────────────────────────────────────
+        for i, ball in enumerate(sequence):
+            # Update preview to show only remaining balls in route
+            state = robot.assess()
+            robot_dets = state["objects_by_class"].get(ROBOT_CLASS, [])
+            if robot_dets:
+                robot_pos = (float(robot_dets[0]["cx"]), float(robot_dets[0]["cy"]))
+                _show_route(robot, robot_pos, sequence[i:])
+
+            target = (int(ball["cx"]), int(ball["cy"]))
+            log.info("Ball %d/%d at %s", i + 1, len(sequence), target)
+
+            # ── 1. Drive to ball ─────────────────────────────────────────────
+            path = robot.find_path(ROBOT_CLASS, target, step_delay=0)
+            if not path:
+                log.warning("No path to ball %d — skipping.", i + 1)
+                continue
+
+            # ── 2. Grab ──────────────────────────────────────────────────────
+            log.info("Closing gripper...")
+            robot.send("close_gripper")
+            time.sleep(0.5)
+
+            # ── 3. Drive to goal ─────────────────────────────────────────────
+            state = robot.assess()
+            goal = _pick_goal(state)
+            if goal is None:
+                log.warning("No goal visible — opening gripper.")
+                robot.send("open_gripper")
+                time.sleep(0.5)
+                continue
+
+            log.info("Depositing at %s...", goal)
+            robot.find_path(ROBOT_CLASS, goal, step_delay=0)
+
+            # ── 4. Deposit ───────────────────────────────────────────────────
             robot.send("open_gripper")
-            time.sleep(1.0)
-            continue
+            time.sleep(0.5)
 
-        log.info("Driving to %s...", goal)
-        robot.find_path(ROBOT_CLASS, goal)
-
-        # ── 4. Deposit ──────────────────────────────────────────────────────
-        log.info("Opening gripper to deposit ball.")
-        robot.send("open_gripper")
-        time.sleep(0.5)
+        # Loop back: replan from new position with any remaining/new balls
 
 
 if __name__ == "__main__":
