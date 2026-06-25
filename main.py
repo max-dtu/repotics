@@ -73,6 +73,67 @@ def _pick_goal(state: dict) -> str | None:
     return None
 
 
+# ── Navigation constants ─────────────────────────────────────────────────────
+_APPROACH_PX = 70   # stop when ball centroid is within this many pixels
+_PROGRESS_PX = 4    # minimum pixels toward ball per step to count as progress
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _drive_to(robot: Robot, tx: float, ty: float) -> bool:
+    """
+    Drive to pixel target (tx, ty) without any heading math.
+
+    Each iteration:
+      1. Send 'forward'.
+      2. Measure the dot-product of the displacement with the direction to
+         the target.  If the robot moved at least _PROGRESS_PX toward it,
+         keep going.  Otherwise turn right and try again next step.
+
+    No heading estimation, no dead reckoning, no sign assumptions about
+    which physical direction the turn commands rotate.
+    """
+    detector = robot._evaluator._detector
+
+    for _ in range(100):
+        state = robot.assess()
+        r     = state["objects_by_class"].get(ROBOT_CLASS, [])
+        if not r:
+            time.sleep(0.05)
+            continue
+
+        rx, ry = float(r[0]["cx"]), float(r[0]["cy"])
+        dist   = math.hypot(tx - rx, ty - ry)
+
+        if hasattr(detector, "set_current_path"):
+            detector.set_current_path([[int(rx), int(ry)], [int(tx), int(ty)]])
+
+        log.info("drive_to: pos=(%.0f,%.0f)  dist=%.0fpx", rx, ry, dist)
+
+        if dist < _APPROACH_PX:
+            return True
+
+        # Drive forward, then measure progress toward target
+        robot.send("forward")
+
+        state2 = robot.assess()
+        r2     = state2["objects_by_class"].get(ROBOT_CLASS, [])
+        if not r2:
+            continue
+        rx2, ry2 = float(r2[0]["cx"]), float(r2[0]["cy"])
+
+        # Dot product of displacement with direction-to-target
+        # positive and large  → moved toward target
+        # small or negative   → moving sideways or away
+        progress = ((rx2 - rx) * (tx - rx) + (ry2 - ry) * (ty - ry)) / max(dist, 1)
+        log.info("  progress=%.1fpx", progress)
+
+        if progress < _PROGRESS_PX:
+            robot.send("right")   # not heading toward ball — turn and retry
+
+    log.warning("_drive_to: max steps reached.")
+    return False
+
+
 def _all_balls(state: dict) -> list:
     return [d for cls in BALL_CLASSES for d in state["objects_by_class"].get(cls, [])]
 
@@ -141,13 +202,12 @@ def run_autonomous(robot: Robot) -> None:
                 robot_pos = (float(robot_dets[0]["cx"]), float(robot_dets[0]["cy"]))
                 _show_route(robot, robot_pos, sequence[i:])
 
-            target = (int(ball["cx"]), int(ball["cy"]))
-            log.info("Ball %d/%d at %s", i + 1, len(sequence), target)
+            target = (float(ball["cx"]), float(ball["cy"]))
+            log.info("Ball %d/%d at (%.0f, %.0f)", i + 1, len(sequence), *target)
 
             # ── 1. Drive to ball ─────────────────────────────────────────────
-            path = robot.find_path(ROBOT_CLASS, target, step_delay=0)
-            if not path:
-                log.warning("No path to ball %d — skipping.", i + 1)
+            if not _drive_to(robot, *target):
+                log.warning("Could not reach ball %d — skipping.", i + 1)
                 continue
 
             # ── 2. Grab ──────────────────────────────────────────────────────
@@ -165,7 +225,10 @@ def run_autonomous(robot: Robot) -> None:
                 continue
 
             log.info("Depositing at %s...", goal)
-            robot.find_path(ROBOT_CLASS, goal, step_delay=0)
+            state      = robot.assess()
+            goal_dets  = state["objects_by_class"].get(goal, [])
+            if goal_dets:
+                _drive_to(robot, float(goal_dets[0]["cx"]), float(goal_dets[0]["cy"]))
 
             # ── 4. Deposit ───────────────────────────────────────────────────
             robot.send("open_gripper")
