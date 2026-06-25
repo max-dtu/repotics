@@ -76,10 +76,9 @@ def _pick_goal(state: dict) -> str | None:
 
 
 # ── Navigation constants ─────────────────────────────────────────────────────
-_APPROACH_PX  = 55    # stop when within this many pixels of target centroid
-_ALIGN_DEG    = 20.0  # acceptable heading error before driving forward
-_DEG_PER_TURN = 28.0  # degrees robot rotates per single turn command
-_NOISE_PX     = 8     # min displacement (px) required to trust as heading
+_APPROACH_PX = 55    # default stop distance (px) from target centroid
+_ALIGN_DEG   = 20.0  # acceptable heading error before driving forward
+_NOISE_PX    = 8     # min displacement (px) required to trust as heading
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Field / obstacle avoidance ───────────────────────────────────────────────
@@ -162,27 +161,24 @@ def _steer_direction(
     return (cx / cmag, cy / cmag)
 
 
-def _drive_to(robot: Robot, tx: float, ty: float) -> bool:
+def _drive_to(robot: Robot, tx: float, ty: float,
+              approach_px: float = _APPROACH_PX) -> bool:
     """
     Drive to pixel target (tx, ty) using heading-aware steering.
 
     Sequence each iteration:
-      1. Read position, update path preview, check arrival.
-      2. Bootstrap (heading=None): drive forward once to get heading from
-         displacement.
-      3. Compute signed angular error from heading to target.
+      1. Read position, update path preview, check arrival (dist < approach_px).
+      2. Bootstrap (heading=None): drive forward once to measure initial heading.
+      3. Compute signed angular error to the potential-field steering direction.
          cross = hx*dy - hy*dx; positive → target is clockwise from heading.
-      4. Misaligned: turn first, never drive.
-         - First turn ever: probe with "right" + forward to calibrate whether
-           "right" is CW or CCW in the camera image. Stored in _right_is_cw.
-         - Subsequent turns: pick "right"/"left" from calibrated polarity and
-           dead-reckon heading by ±_DEG_PER_TURN.
-      5. Aligned: drive forward. Update heading from measured displacement.
-         Hold last heading if below noise floor.
+      4. Misaligned: turn first, then probe forward to measure real heading.
+         - First turn ever: calibration probe (right + forward) sets _right_is_cw.
+         - Subsequent turns: send correct turn, then probe forward for real heading.
+           No dead reckoning — error cannot accumulate.
+      5. Aligned: drive forward and update heading from measured displacement.
     """
     global _right_is_cw
-    detector  = robot._evaluator._detector
-    _TURN_RAD = math.radians(_DEG_PER_TURN)
+    detector = robot._evaluator._detector
 
     heading: tuple[float, float] | None = None
 
@@ -204,7 +200,7 @@ def _drive_to(robot: Robot, tx: float, ty: float) -> bool:
                  rx, ry, dist,
                  "(%.2f,%.2f)" % heading if heading else "?")
 
-        if dist < _APPROACH_PX:
+        if dist < approach_px:
             return True
 
         # ── 2. Bootstrap: drive forward once to get initial heading ─────────
@@ -260,14 +256,20 @@ def _drive_to(robot: Robot, tx: float, ty: float) -> bool:
                   else ("left"  if need_cw else "right")
             robot.send(turn_cmd)
 
-            # Dead-reckon heading: CW rotation in y-down coords
-            theta        = _TURN_RAD if need_cw else -_TURN_RAD
-            cos_t, sin_t = math.cos(theta), math.sin(theta)
-            heading = (
-                cos_t * heading[0] - sin_t * heading[1],
-                sin_t * heading[0] + cos_t * heading[1],
-            )
-            log.info("  Sent %s → est. hdg (%.2f, %.2f)", turn_cmd, *heading)
+            # Probe forward to get ground-truth heading (no dead reckoning)
+            sp1 = robot.assess()
+            rp1 = sp1["objects_by_class"].get(ROBOT_CLASS, [])
+            if rp1:
+                rxp, ryp = float(rp1[0]["cx"]), float(rp1[0]["cy"])
+                robot.send("forward")
+                sp2 = robot.assess()
+                rp2 = sp2["objects_by_class"].get(ROBOT_CLASS, [])
+                if rp2:
+                    rxp2, ryp2 = float(rp2[0]["cx"]), float(rp2[0]["cy"])
+                    dp = math.hypot(rxp2 - rxp, ryp2 - ryp)
+                    if dp >= _NOISE_PX:
+                        heading = ((rxp2 - rxp) / dp, (ryp2 - ryp) / dp)
+                        log.info("  Heading after turn (real): (%.2f, %.2f)", *heading)
             continue
 
         # ── 5. Aligned: drive forward and update heading ─────────────────────
@@ -362,16 +364,16 @@ def run_autonomous(robot: Robot) -> None:
             log.info("Ball %d/%d at (%.0f, %.0f)",
                      i + 1, len(sequence), *target)
 
-            # ── 1. Drive to ball ─────────────────────────────────────────────
-            if not _drive_to(robot, *target):
+            # ── 1. Navigate to just outside gripper range ────────────────────
+            if not _drive_to(robot, *target, approach_px=90):
                 log.warning("Could not reach ball %d — skipping.", i + 1)
                 continue
 
-            # ── 2. Nudge forward so ball seats inside gripper, then close ────
-            log.info("Nudging into ball...")
-            robot.send("forward")
-            robot.send("forward")
-            log.info("Closing gripper...")
+            # ── 2. Open gripper, advance to seat ball, then close ────────────
+            log.info("Gripping ball...")
+            robot.send("open_gripper")
+            time.sleep(0.3)           # let gripper fully open
+            robot.send("forward")     # advance ball into open gripper arms
             robot.send("close_gripper")
 
             # ── 3. Find goal — spin until one is visible ──────────────────────
