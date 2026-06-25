@@ -164,6 +164,14 @@ class Camera:
         """
         return self._detector.get_detections()
 
+    def save_targets(self, filepath: str = "targets.json") -> None:
+        """Saves current tracked target object signatures to a JSON file."""
+        self._detector.save_targets(filepath)
+
+    def load_targets(self, filepath: str = "targets.json") -> None:
+        """Loads target object signatures from a JSON file and starts tracking."""
+        self._detector.load_targets(filepath)
+
     # ------------------------------------------------------------------
     # Dynamic parameter configuration properties
     # ------------------------------------------------------------------

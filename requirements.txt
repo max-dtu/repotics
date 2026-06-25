@@ -1,4 +1,5 @@
 certifi==2026.6.17
+accelerate==1.14.0
 charset-normalizer==3.4.7
 contourpy==1.3.3
 cycler==0.12.1
@@ -23,6 +24,7 @@ psutil==7.2.2
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
+qwen-vl-utils==0.0.14
 requests==2.34.2
 scipy==1.12.0
 six==1.17.0
@@ -30,6 +32,7 @@ sympy==1.14.0
 torch==2.2.2
 torchaudio==2.2.2
 torchvision==0.17.2
+transformers==4.47.1
 typing_extensions==4.15.0
 ultralytics==8.4.75
 ultralytics-thop==2.0.20

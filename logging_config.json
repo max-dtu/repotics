@@ -1,0 +1,6 @@
+{
+    "detection": false,
+    "path_finding": true,
+    "follow_path": true,
+    "robot": true
+}

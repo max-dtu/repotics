@@ -50,16 +50,23 @@ class Commander:
     # Public API
     # ------------------------------------------------------------------
 
-    def send(self, command: Command) -> None:
+    def send(self, command: Command) -> bool:
         """
         Send *command* to the robot.
 
         Logs the dispatch at INFO level regardless of backend, then delegates
         to the backend callable.  Any exception raised by the backend is
         propagated to the caller so the Agent can handle it.
+
+        Returns
+        -------
+        bool: True if the send succeeded, False otherwise.
         """
         logger.info(f"Sending command: {command.value!r}")
-        self._backend(command)
+        res = self._backend(command)
+        if res is False:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Built-in backends

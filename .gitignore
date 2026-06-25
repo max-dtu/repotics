@@ -1,6 +1,8 @@
 /.venv
+/.cache
 .DS_Store
 __pycache__/
 *.pyc
 *.pyo
 *.pt
+qwen_latest_frame.jpg

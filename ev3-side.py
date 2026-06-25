@@ -15,10 +15,14 @@ PORT            = 9999         # Must match the port used by the MacBook
 DRIVE_SPEED     = -400         # Motor speed for driving (deg/s). Negate if forward drives backward.
 DRIVE_DURATION  = 0.3          # Seconds each drive command runs
 TURN_SPEED      = 300          # Motor speed for turning (deg/s)
-TURN_DURATION   = 0.2          # Seconds each turn command runs. Reduce to turn less per command.
+TURN_DURATION   = 0.08          # Seconds each turn command runs. Reduce to turn less per command.
 GRIPPER_SPEED   = 200          # Motor speed for gripper (deg/s)
 GRIPPER_OPEN_POS  = 120        # Gripper open position relative to close (deg)
 GRIPPER_CLOSE_POS = -120        # Gripper close angle from open position (deg)
+
+# Internet Remote Mode Configuration (for mobile hotspot/cellular)
+REMOTE_MODE       = False         # Set to True to receive commands over the internet
+ROBOT_UNIQUE_ID   = "kals-ev3" # Customize this unique ID to send commands
 
 # Port A = left drive motor, Port B = right drive motor, Port C = gripper
 MOTOR_LEFT_PORT    = "outA"
@@ -166,26 +170,68 @@ def _local_ips():
 
 
 def main():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(1)
+    if REMOTE_MODE:
+        import urllib.request
+        import json
+        
+        url = "http://ntfy.sh/{}/json".format(ROBOT_UNIQUE_ID)
+        
+        print("=" * 48)
+        print("  EV3 robot server READY (INTERNET REMOTE MODE)")
+        print("  Robot ID : {}".format(ROBOT_UNIQUE_ID))
+        print("  MacBook EV3_HOST should be:")
+        print("    'ntfy:{}' or 'dweet:{}'".format(ROBOT_UNIQUE_ID, ROBOT_UNIQUE_ID))
+        print("=" * 48)
+        
+        while True:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                log.info("Connecting to ntfy.sh stream...")
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    log.info("Stream connected.")
+                    for line in response:
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line.decode("utf-8", errors="ignore"))
+                            if data.get("event") == "message":
+                                cmd = data.get("message", "").strip()
+                                if cmd:
+                                    log.info("Received internet command: %r", cmd)
+                                    handler = HANDLERS.get(cmd)
+                                    if handler:
+                                        try:
+                                            handler()
+                                        except Exception as exc:
+                                            log.error("Handler error for %r: %s", cmd, exc)
+                                    else:
+                                        log.warning("Unknown command: %r", cmd)
+                        except Exception as parse_err:
+                            log.error("Parse error for line %r: %s", line, parse_err)
+            except Exception as e:
+                log.error("Internet connection error (%s). Reconnecting in 3 seconds...", e)
+                time.sleep(3)
+    else:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((HOST, PORT))
+        srv.listen(1)
 
-    ips = _local_ips()
-    print("=" * 48)
-    print("  EV3 robot server READY")
-    print("  Port : {}".format(PORT))
-    for ip in ips:
-        print("  IP   : {}".format(ip))
-    print("")
-    print("  Connect from MacBook:")
-    for ip in ips:
-        print("    {}:{}".format(ip, PORT))
-    print("=" * 48)
+        ips = _local_ips()
+        print("=" * 48)
+        print("  EV3 robot server READY (LOCAL TCP MODE)")
+        print("  Port : {}".format(PORT))
+        for ip in ips:
+            print("  IP   : {}".format(ip))
+        print("")
+        print("  Connect from MacBook:")
+        for ip in ips:
+            print("    {}:{}".format(ip, PORT))
+        print("=" * 48)
 
-    while True:
-        conn, addr = srv.accept()
-        handle_client(conn, addr)  # single-client; one at a time
+        while True:
+            conn, addr = srv.accept()
+            handle_client(conn, addr)  # single-client; one at a time
 
 if __name__ == "__main__":
     main()

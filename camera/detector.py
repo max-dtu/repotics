@@ -94,6 +94,8 @@ class Detector:
         self._lost_flags: dict[int, bool] = {}
         # EMA-smoothed bbox per object: (cx, cy, w, h) — reduces jitter.
         self._smoothed_bboxes: dict[int, tuple] = {}
+        self._detections_counter = 0
+        self._detections_updated = threading.Condition()
 
     @property
     def is_running(self) -> bool:
@@ -255,6 +257,17 @@ class Detector:
             })
         return dets
 
+    def get_detections_counter(self) -> int:
+        with self._detections_updated:
+            return self._detections_counter
+
+    def wait_for_fresh_detections(self, last_count: int, timeout: float = 2.0) -> bool:
+        with self._detections_updated:
+            return self._detections_updated.wait_for(
+                lambda: self._detections_counter > last_count,
+                timeout=timeout
+            )
+
     def set_click_target(self, x, y, heading_x=None, heading_y=None) -> None:
         """Register a new click target.
 
@@ -354,6 +367,107 @@ class Detector:
                 sys.stdout.write(f"\robject is {class_name}\n")
                 sys.stdout.flush()
 
+    def save_targets(self, filepath: str = "targets.json") -> None:
+        """Saves current tracked target object signatures to a JSON file."""
+        import json
+        with self._state_lock:
+            serializable_targets = []
+            for obj in self._target_objects:
+                obj_id = obj["id"]
+                token_list = obj["token"].tolist() if hasattr(obj["token"], "tolist") else list(obj["token"])
+                initial_polygon = obj.get("initial_polygon")
+                class_name = obj.get("class_name", "object")
+                
+                heading_vec = self._heading_vecs.get(obj_id)
+                heading_list = heading_vec.tolist() if hasattr(heading_vec, "tolist") else (list(heading_vec) if heading_vec is not None else None)
+                
+                centroid = self._last_centroids.get(obj_id)
+                size = self._last_sizes.get(obj_id)
+                
+                serializable_targets.append({
+                    "id": obj_id,
+                    "token": token_list,
+                    "class_name": class_name,
+                    "initial_polygon": initial_polygon,
+                    "heading_vec": heading_list,
+                    "centroid": centroid,
+                    "size": size
+                })
+            
+            try:
+                with open(filepath, "w") as f:
+                    json.dump(serializable_targets, f, indent=4)
+                logger.info(f"Successfully saved {len(serializable_targets)} target signatures to '{filepath}'")
+            except Exception as e:
+                logger.error(f"Failed to save target signatures to '{filepath}': {e}")
+
+    def load_targets(self, filepath: str = "targets.json") -> None:
+        """Loads target object signatures from a JSON file and starts tracking."""
+        import json
+        import torch
+        import numpy as np
+        import sys
+        
+        try:
+            with open(filepath, "r") as f:
+                loaded_targets = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load target signatures from '{filepath}': {e}")
+            return
+
+        with self._state_lock:
+            # Clear existing tracking states
+            self._target_objects = []
+            self._click_headings = {}
+            self._heading_vecs = {}
+            self._pca_axes = {}
+            self._last_centroids = {}
+            self._last_sizes = {}
+            self._pending_clicks = []
+            self._pending_boxes = []
+            self._next_object_id = 0
+            
+            for target in loaded_targets:
+                obj_id = target["id"]
+                token_tensor = torch.tensor(target["token"], dtype=torch.float32)
+                class_name = target.get("class_name", "object")
+                initial_polygon = target.get("initial_polygon")
+                
+                self._target_objects.append({
+                    "id": obj_id,
+                    "token": token_tensor,
+                    "class_name": class_name,
+                    "initial_polygon": initial_polygon
+                })
+                
+                if target.get("centroid") is not None:
+                    self._last_centroids[obj_id] = tuple(target["centroid"])
+                if target.get("size") is not None:
+                    self._last_sizes[obj_id] = tuple(target["size"])
+                if target.get("heading_vec") is not None:
+                    self._heading_vecs[obj_id] = np.array(target["heading_vec"], dtype=np.float32)
+                    
+                    # Compute initial arrow tip / click heading
+                    if self._last_centroids.get(obj_id) is not None and self._last_sizes.get(obj_id) is not None:
+                        cx, cy = self._last_centroids[obj_id]
+                        w, h = self._last_sizes[obj_id]
+                        h_vec = self._heading_vecs[obj_id]
+                        arrow_len = float(np.sqrt((w / 2) ** 2 + (h / 2) ** 2)) * 1.3
+                        tip_x = int(cx + h_vec[0] * arrow_len)
+                        tip_y = int(cy + h_vec[1] * arrow_len)
+                        self._click_headings[obj_id] = (tip_x, tip_y)
+                
+                self._next_object_id = max(self._next_object_id, obj_id + 1)
+            
+            self._tracking_active = True
+            logger.info(f"Loaded {len(self._target_objects)} target signatures from '{filepath}'. Tracking activated.")
+            for obj in self._target_objects:
+                obj_id = obj["id"]
+                class_name = obj.get("class_name", "object")
+                logger.info(f"Object {obj_id} is recognized as '{class_name}'")
+                sys.stdout.write(f"\robject is {class_name}\n")
+                sys.stdout.flush()
+
     def set_current_path(self, points: list[list[int]] | None) -> None:
         """Sets the current planned path waypoints to show in preview."""
         with self._state_lock:
@@ -395,6 +509,9 @@ class Detector:
 
                 with self._detections_lock:
                     self._latest_detections = detections
+                with self._detections_updated:
+                    self._detections_counter += 1
+                    self._detections_updated.notify_all()
 
         except Exception:
             logger.exception("Unexpected exception in detector inference loop.")
@@ -420,7 +537,14 @@ class Detector:
           - YOLOv8 detection + SAM prompted segmentation (e.g., 'yolov8n.pt+mobile_sam.pt')
           - SAM 2 + DINOv2 visual tracking ('SAM2+DINOv2')
         """
-        if model_path in ("YOLO+DINOv2", "YOLO+DINO", "SAM2+DINOv2"):
+        is_dino = False
+        if model_path:
+            if model_path in ("YOLO+DINOv2", "YOLO+DINO", "SAM2+DINOv2"):
+                is_dino = True
+            elif model_path.endswith(".pt") and "sam" not in model_path.lower():
+                is_dino = True
+
+        if is_dino:
             import torch
             import torchvision.transforms.functional as TF
             from ultralytics import YOLO
@@ -492,10 +616,16 @@ class Detector:
                     features = self._cached_dino_model.forward_features(img_t)
                     patch_tokens = features["x_norm_patchtokens"]  # [1, 1024, 384]
 
-                if not hasattr(self, "_cached_yolo_model"):
-                    logger.info("Loading YOLOv8 model (yolov8n-seg.pt) for target snapping...")
-                    self._cached_yolo_model = YOLO("yolov8n-seg.pt")
-                    logger.info("YOLOv8 model loaded successfully.")
+                # Dynamically resolve yolo model path
+                yolo_model_path = "yolov8n-seg.pt"
+                if model_path and model_path.endswith(".pt") and "sam" not in model_path.lower():
+                    yolo_model_path = model_path
+
+                if not hasattr(self, "_cached_yolo_model") or getattr(self, "_cached_yolo_path", None) != yolo_model_path:
+                    logger.info(f"Loading YOLO model ({yolo_model_path}) for DINOv2 visual tracking...")
+                    self._cached_yolo_model = YOLO(yolo_model_path)
+                    self._cached_yolo_path = yolo_model_path
+                    logger.info("YOLO model loaded successfully.")
 
                 yolo_results = self._cached_yolo_model(frame, verbose=False)[0]
                 yolo_candidates = []
@@ -718,6 +848,25 @@ class Detector:
                                     h_diff = abs(matched_h - prev_h)
                                     if centroid_dist < 2.0 and w_diff < 2.0 and h_diff < 2.0:
                                         is_stationary = True
+
+                                # Translation-based heading tracking fallback:
+                                # If the object translated significantly, align heading vector with motion direction.
+                                if prev_centroid is not None:
+                                    prev_cx, prev_cy = prev_centroid
+                                    dx_move = matched_cx - prev_cx
+                                    dy_move = matched_cy - prev_cy
+                                    move_dist = np.sqrt(dx_move**2 + dy_move**2)
+                                    if move_dist > 3.0:
+                                        move_vec = np.array([dx_move, dy_move], dtype=np.float32) / move_dist
+                                        dot_prod = np.dot(move_vec, heading_vec)
+                                        # Only update if the motion is collinear (forward/backward)
+                                        if abs(dot_prod) > 0.5:
+                                            target_heading = move_vec if dot_prod > 0 else -move_vec
+                                            # Apply EMA smoothing to the heading vector
+                                            beta = 0.25
+                                            heading_vec = beta * target_heading + (1.0 - beta) * heading_vec
+                                            heading_vec = heading_vec / (np.linalg.norm(heading_vec) + 1e-8)
+                                            self._heading_vecs[obj_id] = heading_vec
 
                                 rect = cv2.minAreaRect(matched_polygon.astype(np.float32))
                                 box_pts = cv2.boxPoints(rect)
