@@ -189,6 +189,23 @@ class FrameReader:
             if not ok or frame is None:
                 consecutive_failures += 1
                 logger.warning(f"Frame read failure ({consecutive_failures}/{max_failures}).")
+                
+                # Reopen camera if we have several consecutive failures to attempt hardware recovery
+                if consecutive_failures % 10 == 0 and consecutive_failures < max_failures:
+                    logger.info("Attempting to recover camera by reopening device...")
+                    try:
+                        cap.release()
+                        new_cap = cv2.VideoCapture(self.index)
+                        if new_cap.isOpened():
+                            self.cap = new_cap
+                            cap = new_cap
+                            logger.info("Camera recovered and reopened successfully.")
+                        else:
+                            new_cap.release()
+                            logger.warning("Failed to reopen camera during recovery.")
+                    except Exception as exc:
+                        logger.error(f"Error reopening camera during recovery: {exc}")
+
                 if consecutive_failures >= max_failures:
                     logger.critical("Max consecutive read failures reached. Stopping reader.")
                     self._running = False

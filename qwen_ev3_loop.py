@@ -1,3 +1,4 @@
+from functorch.experimental import control_flow
 import argparse
 import json
 import logging
@@ -8,6 +9,9 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+# Enable high watermark ratio bypass to allow MPS to use system RAM paging on macOS
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+
 import cv2
 from PIL import Image
 
@@ -15,24 +19,28 @@ from camera import Camera
 from robot import Command
 
 
-DEFAULT_MODEL = "Qwen/Qwen2-VL-2B-Instruct"
-DEFAULT_PROMPT = (
-    "You control a robot. Current task: {task}. "
-    "Goal: satisfy the task using the camera frame. "
-    "Choose exactly one command: left, right, forward, backward. "
-    "If unsure, rotate left or right. "
-    "Also decide whether the task is already complete. "
-    "Reply only with compact JSON in this exact shape: "
-    '{"command":"left|right|forward|backward","task_done":true|false,'
-    '"car_visible":true|false,"ball_visible":true|false,'
-    '"target":"car|ball|unknown","reason":"short reason"}.'
-)
-ALLOWED_COMMANDS = {
+AVAILABLE_COMMANDS = [
     Command.LEFT.value,
     Command.RIGHT.value,
     Command.FORWARD.value,
     Command.BACKWARD.value,
-}
+    Command.OPEN_GRIPPER.value,
+    Command.CLOSE_GRIPPER.value,
+]
+ALLOWED_COMMANDS = set(AVAILABLE_COMMANDS)
+
+_cmds_str = ", ".join(AVAILABLE_COMMANDS)
+
+CLASSES_OF_INTEREST = set(["ball","car"])
+_CLASSES_OF_INTEREST_str = ",".join(CLASSES_OF_INTEREST)
+
+# Available choices e.g.: "Qwen/Qwen2.5-VL-7B-Instruct", "Qwen/Qwen2-VL-2B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen2-VL-2B-Instruct"
+DEFAULT_PROMPT = (
+    f'You control a robot by choosing the best available command from [{_cmds_str}] based on the current task and the camera frame. Current task: {{task}} See the camera frame, detect {_CLASSES_OF_INTEREST_str}; evaluate; and then respond. If unsure which command to choose, choose left or right command randomly. '
+    'Also decide whether the task is already complete. If the task is complete, set "task_done" to true. '
+    'Reply only with compact JSON in this exact shape: {"command":"...","task_done":true|false,"visible_objects_of_interest":"..."}'
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +49,8 @@ logger = logging.getLogger(__name__)
 class VisionDecision:
     command: str | None
     task_done: bool = False
-    car_visible: bool | None = None
-    ball_visible: bool | None = None
-    target: str = "unknown"
-    reason: str = ""
+    visible_objects_of_interest: set[str] | None = None
+    objects_of_interest_closest: str | None = None
     raw_output: str = ""
 
 
@@ -137,6 +143,28 @@ def save_latest_frame(image: Image.Image, path: str | None) -> None:
     image.save(path)
 
 
+def wrap_stand_out(label: str, text: str) -> str:
+    color_border = "\033[1;35m" # Bold Magenta
+    color_content = "\033[1;32m" # Bold Green
+    reset = "\033[0m"
+    
+    lines = text.strip().split("\n")
+    width = max(len(line) for line in lines) if lines else 0
+    width = max(width, len(label))
+    
+    border = "═" * (width + 4)
+    
+    result = []
+    result.append(f"{color_border}╔{border}╗{reset}")
+    result.append(f"{color_border}║  {color_content}{label.center(width)}{color_border}  ║{reset}")
+    result.append(f"{color_border}╠{border}╣{reset}")
+    for line in lines:
+        result.append(f"{color_border}║  {color_content}{line.ljust(width)}{color_border}  ║{reset}")
+    result.append(f"{color_border}╚{border}╝{reset}")
+    
+    return "\n" + "\n".join(result)
+
+
 def parse_command(text: str) -> str | None:
     cleaned = text.strip().lower().strip(".,:;!?\"'`")
     if cleaned in ALLOWED_COMMANDS:
@@ -166,13 +194,22 @@ def parse_decision(text: str) -> VisionDecision:
     data = _extract_json_object(text)
     if data is not None:
         command = parse_command(str(data.get("command", "")))
+        
+        visible = data.get("visible_objects_of_interest")
+        visible_set = None
+        if isinstance(visible, str):
+            visible_set = {x.strip() for x in visible.replace("|", ",").split(",") if x.strip()}
+        elif isinstance(visible, list):
+            visible_set = {str(x).strip() for x in visible if str(x).strip()}
+            
+        closest = data.get("object_closest_to_robot")
+        closest_str = str(closest).strip() if closest is not None else None
+
         return VisionDecision(
             command=command,
             task_done=data.get("task_done") if isinstance(data.get("task_done"), bool) else False,
-            car_visible=data.get("car_visible") if isinstance(data.get("car_visible"), bool) else None,
-            ball_visible=data.get("ball_visible") if isinstance(data.get("ball_visible"), bool) else None,
-            target=str(data.get("target", "unknown"))[:40],
-            reason=str(data.get("reason", ""))[:240],
+            visible_objects_of_interest=visible_set,
+            objects_of_interest_closest=closest_str,
             raw_output=text,
         )
 
@@ -182,6 +219,11 @@ def parse_decision(text: str) -> VisionDecision:
 def model_input_device(model):
     import torch
 
+    if hasattr(model, "model"):
+        try:
+            return next(model.model.parameters()).device
+        except StopIteration:
+            pass
     try:
         return next(model.parameters()).device
     except StopIteration:
@@ -228,6 +270,10 @@ def choose_command(model, processor, image: Image.Image, prompt: str) -> VisionD
         tokenize=False,
         add_generation_prompt=True,
     )
+    
+    logger.info("Model string input (prompt):\n%s", prompt)
+    logger.info("Model string input (chat_text):\n%s", chat_text)
+
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[chat_text],
@@ -250,6 +296,9 @@ def choose_command(model, processor, image: Image.Image, prompt: str) -> VisionD
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )[0]
+    
+    logger.info(wrap_stand_out("Model string output", output))
+    
     return parse_decision(output)
 
 
@@ -277,23 +326,68 @@ def resolve_device_map(device: str):
     if device == "cpu":
         return {"": "cpu"}
     if device == "mps":
-        return {"": "mps"}
+        # Offload the visual transformer block (Conv3D) to CPU to avoid MPS not supported crash,
+        # and map everything else to mps.
+        return {
+            "visual": "cpu",
+            "": "mps"
+        }
     raise ValueError(f"Unsupported device: {device}")
 
 
 def load_model(model_name: str, dtype: str, device: str, local_files_only: bool = False):
     configure_huggingface_cache()
 
-    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    import torch
+    # limit threads to prevent system starvation on CPU
+    if device in ("cpu", "mps") or (device == "auto" and not torch.cuda.is_available()):
+        num_cores = os.cpu_count() or 4
+        torch_threads = max(1, num_cores - 2)
+        torch.set_num_threads(torch_threads)
+        logger.info("Set torch CPU threads to %d (system has %d cores) to prevent thread starvation", torch_threads, num_cores)
+
+    from transformers import AutoProcessor, AutoModelForVision2Seq
 
     logger.info("Loading %s", model_name)
     torch_dtype = resolve_torch_dtype(dtype, device)
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = AutoModelForVision2Seq.from_pretrained(
         model_name,
         torch_dtype=torch_dtype,
         device_map=resolve_device_map(device),
         local_files_only=local_files_only,
     )
+
+    # Workaround for MPS not supporting Conv3D & Float16 LayerNorm on CPU:
+    # If the device is MPS, we configure a hybrid CPU-Float32 and MPS-Float16 device map.
+    if device == "mps":
+        # 1. Remove the default accelerate hook from visual submodule to prevent it from moving back to MPS
+        if hasattr(model.visual, "_hf_hook"):
+            from accelerate.hooks import remove_hook_from_module
+            remove_hook_from_module(model.visual, recurse=True)
+
+        # 2. Move the visual submodule to CPU in Float32 to bypass PyTorch CPU LayerNorm Float16 constraint
+        model.visual.to(device="cpu", dtype=torch.float32)
+
+        # 3. Override model.device property so model.generate knows the language model is running on MPS
+        type(model).device = property(lambda self: next(self.model.parameters()).device)
+
+        # 4. Register pre-forward hook to cast inputs to Float32 on CPU when entering visual submodule
+        def move_inputs_to_cpu_float32(module, args, kwargs):
+            new_args = tuple(x.to("cpu", dtype=torch.float32) if isinstance(x, torch.Tensor) and x.is_floating_point() else x for x in args)
+            new_kwargs = {k: v.to("cpu", dtype=torch.float32) if isinstance(v, torch.Tensor) and v.is_floating_point() else v for k, v in kwargs.items()}
+            return new_args, new_kwargs
+
+        # 5. Register forward hook to cast outputs to Float16 and move them back to MPS when leaving visual submodule
+        def move_outputs_to_mps_float16(module, input, output):
+            if isinstance(output, torch.Tensor):
+                return output.to("mps", dtype=torch.float16)
+            elif isinstance(output, tuple):
+                return tuple(x.to("mps", dtype=torch.float16) if isinstance(x, torch.Tensor) else x for x in output)
+            return output
+
+        model.visual.register_forward_pre_hook(move_inputs_to_cpu_float32, with_kwargs=True)
+        model.visual.register_forward_hook(move_outputs_to_mps_float16)
+
     model.generation_config.temperature = None
     model.generation_config.top_p = None
     model.generation_config.top_k = None
@@ -339,16 +433,14 @@ def run(args) -> None:
             command = decision.command
 
             logger.info(
-                "Vision decision: task=%r done=%s command=%s car_visible=%s ball_visible=%s target=%s reason=%s",
+                "Vision decision: task=%r done=%s command=%s objects_visible=%s closest_object=%s",
                 task,
                 decision.task_done,
                 command,
-                decision.car_visible,
-                decision.ball_visible,
-                decision.target,
-                decision.reason or "<none>",
+                decision.visible_objects_of_interest,
+                decision.objects_of_interest_closest or "<none>",
             )
-            logger.info("Model raw output: %s", decision.raw_output.strip())
+            logger.info(wrap_stand_out("Model raw output", decision.raw_output))
             if args.save_latest_frame:
                 logger.info("Model frame: %s (%dx%d)", args.save_latest_frame, image.width, image.height)
 

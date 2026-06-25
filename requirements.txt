@@ -32,7 +32,7 @@ sympy==1.14.0
 torch==2.2.2
 torchaudio==2.2.2
 torchvision==0.17.2
-transformers==4.47.1
+transformers==4.49.0
 typing_extensions==4.15.0
 ultralytics==8.4.75
 ultralytics-thop==2.0.20

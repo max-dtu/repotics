@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 ev3-side.py — Robot socket server for EV3 (ev3dev, Python 3.5+)
 
