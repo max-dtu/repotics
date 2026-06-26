@@ -3,12 +3,13 @@ import math
 import socket
 import sys
 import time
+from enum import Enum, auto
 
 from camera import Camera
 from robot import Robot, Command
 
 # ── EV3 connection ──────────────────────────────────────────────────────────
-EV3_HOST = "10.45.151.18"   # EV3 IP shown in its startup banner
+EV3_HOST = "10.187.118.18"
 EV3_PORT = 9999
 
 _sock = None
@@ -18,7 +19,7 @@ def _ev3_backend(command: Command) -> None:
     """Send command over TCP; auto-reconnect on failure."""
     global _sock
     payload = (command.value + "\n").encode()
-    for attempt in range(2):
+    for _ in range(2):
         try:
             if _sock is None:
                 _sock = socket.create_connection(
@@ -38,7 +39,6 @@ def _ev3_backend(command: Command) -> None:
             _sock = None
     logging.getLogger(__name__).error(
         "Could not send %r to EV3 after retry.", command.value)
-# ────────────────────────────────────────────────────────────────────────────
 
 
 class _ReadlineAwareHandler(logging.StreamHandler):
@@ -59,360 +59,417 @@ logging.basicConfig(
 
 log = logging.getLogger(__name__)
 
-# ── Class names — adjust to match your best.pt labels ───────────────────────
+# ── Class names ──────────────────────────────────────────────────────────────
 BALL_CLASSES = ("WhiteBall", "OrangeBall", "orange_ball", "white_ball")
 ROBOT_CLASS = "Car"
-# preferred order (more points first)
 GOAL_CLASSES = ("small_goal", "big_goal")
-# ────────────────────────────────────────────────────────────────────────────
+
+# ── Navigation constants ─────────────────────────────────────────────────────
+_APPROACH_BALL_PX = 90    # px: stop when this close to ball centroid
+_APPROACH_GOAL_PX = 55    # px: stop when this close to goal centroid
+_ALIGN_DEG = 10.0  # °: drive forward when heading error is within ±10°
+_NOISE_PX = 4     # px: minimum displacement to trust as real movement
+# Camera runs inference in a background thread.  Without this settle delay,
+# robot.assess() returns the frame captured *before* the motor ran — so
+# displacement is always ~0 px and heading measurement always fails.
+_CMD_SETTLE_S = 0.20
+
+# ── Module-level navigation state ────────────────────────────────────────────
+# Kept global so heading earned in APPROACH_BALL is reused in APPROACH_GOAL.
+_heading:     tuple[float, float] | None = None   # unit vector (hx, hy)
+_right_is_cw: bool | None = None                  # True if "right" rotates CW
+
+FRAME_W = 640
+FRAME_H = 480
+
+
+# ── FSM ───────────────────────────────────────────────────────────────────────
+class RobotState(Enum):
+    SEARCH_BALL = auto()
+    APPROACH_BALL = auto()
+    PICKUP = auto()
+    SEARCH_GOAL = auto()
+    APPROACH_GOAL = auto()
+    DROP = auto()
+    DONE = auto()
+
+
+def _transition(cur: RobotState, nxt: RobotState, reason: str = "") -> RobotState:
+    log.info("[FSM] %s → %s  %s", cur.name, nxt.name, reason)
+    return nxt
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _all_balls(state: dict) -> list:
+    return [d for cls in BALL_CLASSES
+            for d in state["objects_by_class"].get(cls, [])]
 
 
 def _pick_goal(state: dict) -> str | None:
-    """Return the best visible goal class name, or None."""
     for goal in GOAL_CLASSES:
         if goal in state["objects_by_class"]:
             return goal
     return None
 
 
-# ── Navigation constants ─────────────────────────────────────────────────────
-_APPROACH_PX = 55    # default stop distance (px) from target centroid
-_ALIGN_DEG   = 20.0  # acceptable heading error before driving forward
-_NOISE_PX    = 8     # min displacement (px) required to trust as heading
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Field / obstacle avoidance ───────────────────────────────────────────────
-FRAME_W        = 640   # camera frame width  (px)
-FRAME_H        = 480   # camera frame height (px)
-_BORDER_MARGIN = 80    # px from edge to activate border repulsion
-_OBS_MARGIN    = 110   # px from YOLO obstacle centroid to activate repulsion
-_BORDER_W      = 1.5   # border repulsion weight vs attraction
-_OBS_W         = 2.5   # obstacle repulsion weight vs attraction
-
-# Hardcoded obstacles (cx, cy, radius_px).
-# Add the cross here if YOLO does not detect it, e.g.:
-#   _FIXED_OBSTACLES = [(320, 240, 70)]  # cross at frame centre
-_FIXED_OBSTACLES: list[tuple[float, float, float]] = []
-# ─────────────────────────────────────────────────────────────────────────────
-
-# True  = "right" command is clockwise in the camera image
-# False = "right" is counter-clockwise
-# None  = not yet determined (calibrated on the first turn needed)
-_right_is_cw: bool | None = None
+def _send(robot: Robot, cmd: str) -> None:
+    """Log, send, then pause so the camera thread captures a fresh frame."""
+    log.info("    → CMD: %s", cmd.upper())
+    robot.send(cmd)
+    time.sleep(_CMD_SETTLE_S)
 
 
-def _steer_direction(
-    rx: float, ry: float,
-    tx: float, ty: float,
-    state: dict,
-) -> tuple[float, float]:
+def _read_pos(robot: Robot) -> tuple[float | None, float | None, dict]:
+    """Return (rx, ry, full_state).  rx/ry are None if robot not detected."""
+    state = robot.assess()
+    r = state["objects_by_class"].get(ROBOT_CLASS, [])
+    if not r:
+        return None, None, state
+    return float(r[0]["cx"]), float(r[0]["cy"]), state
+
+
+def _store_heading(rx0: float, ry0: float,
+                   rx1: float, ry1: float) -> bool:
     """
-    Return a normalised (dx, dy) steering direction blending:
-      - attraction toward (tx, ty)
-      - repulsion from the four field borders
-      - repulsion from YOLO-detected obstacles (non-ball / non-goal / non-robot)
-      - repulsion from hardcoded _FIXED_OBSTACLES (e.g. the cross)
+    Compute heading from displacement (rx0,ry0)→(rx1,ry1) and store it
+    in the global _heading.  Returns False if displacement is below the
+    noise floor (measurement would be unreliable).
     """
-    dist = math.hypot(tx - rx, ty - ry)
-    if dist < 1e-3:
-        return (0.0, 0.0)
-
-    ax = (tx - rx) / dist
-    ay = (ty - ry) / dist
-
-    # Border repulsion
-    bx, by = 0.0, 0.0
-    if rx < _BORDER_MARGIN:
-        bx += (_BORDER_MARGIN - rx) / _BORDER_MARGIN
-    if rx > FRAME_W - _BORDER_MARGIN:
-        bx -= (rx - (FRAME_W - _BORDER_MARGIN)) / _BORDER_MARGIN
-    if ry < _BORDER_MARGIN:
-        by += (_BORDER_MARGIN - ry) / _BORDER_MARGIN
-    if ry > FRAME_H - _BORDER_MARGIN:
-        by -= (ry - (FRAME_H - _BORDER_MARGIN)) / _BORDER_MARGIN
-
-    # YOLO obstacle repulsion (any class not recognised as ball / goal / robot)
-    known = frozenset(BALL_CLASSES) | frozenset(GOAL_CLASSES) | {ROBOT_CLASS}
-    ox, oy = 0.0, 0.0
-    for det in state.get("detections", []):
-        if det.get("class_name", "") in known:
-            continue
-        dcx, dcy = float(det["cx"]), float(det["cy"])
-        odist = math.hypot(rx - dcx, ry - dcy)
-        if 0 < odist < _OBS_MARGIN:
-            mag = (_OBS_MARGIN - odist) / _OBS_MARGIN
-            ox += (rx - dcx) / odist * mag
-            oy += (ry - dcy) / odist * mag
-
-    # Hardcoded obstacle repulsion (cross, walls, etc.)
-    for (fcx, fcy, frad) in _FIXED_OBSTACLES:
-        odist = math.hypot(rx - fcx, ry - fcy)
-        if 0 < odist < frad:
-            mag = (frad - odist) / frad
-            ox += (rx - fcx) / odist * mag
-            oy += (ry - fcy) / odist * mag
-
-    cx = ax + _BORDER_W * bx + _OBS_W * ox
-    cy = ay + _BORDER_W * by + _OBS_W * oy
-
-    cmag = math.hypot(cx, cy)
-    if cmag < 1e-6:
-        return (ax, ay)
-    return (cx / cmag, cy / cmag)
+    global _heading
+    d = math.hypot(rx1 - rx0, ry1 - ry0)
+    if d < _NOISE_PX:
+        log.warning("  Disp %.1f px < %d px noise floor — heading NOT updated",
+                    d, _NOISE_PX)
+        return False
+    _heading = ((rx1 - rx0) / d, (ry1 - ry0) / d)
+    log.info("  Disp %.1f px  (%.0f,%.0f)→(%.0f,%.0f)  New heading: %.0f°",
+             d, rx0, ry0, rx1, ry1,
+             math.degrees(math.atan2(_heading[1], _heading[0])))
+    return True
 
 
-def _drive_to(robot: Robot, tx: float, ty: float,
-              approach_px: float = _APPROACH_PX) -> bool:
+def _bearing_error(tx: float, ty: float, rx: float, ry: float) -> float:
     """
-    Drive to pixel target (tx, ty) using heading-aware steering.
-
-    Sequence each iteration:
-      1. Read position, update path preview, check arrival (dist < approach_px).
-      2. Bootstrap (heading=None): drive forward once to measure initial heading.
-      3. Compute signed angular error to the potential-field steering direction.
-         cross = hx*dy - hy*dx; positive → target is clockwise from heading.
-      4. Misaligned: turn first, then probe forward to measure real heading.
-         - First turn ever: calibration probe (right + forward) sets _right_is_cw.
-         - Subsequent turns: send correct turn, then probe forward for real heading.
-           No dead reckoning — error cannot accumulate.
-      5. Aligned: drive forward and update heading from measured displacement.
+    Signed angle from current heading to direct bearing toward (tx, ty).
+      Positive → target is clockwise  (right) of heading → turn CW.
+      Negative → target is counter-clockwise (left) → turn CCW.
+    Range: [-180, 180].  Uses direct bearing; no potential field.
     """
-    global _right_is_cw
-    detector = robot._evaluator._detector
+    bearing = math.degrees(math.atan2(ty - ry, tx - rx))
+    hdg = math.degrees(math.atan2(_heading[1], _heading[0]))
+    raw = bearing - hdg
+    return ((raw + 180) % 360) - 180
 
-    heading: tuple[float, float] | None = None
 
-    for _ in range(100):
-        # ── 1. Read position ────────────────────────────────────────────────
-        state = robot.assess()
-        r     = state["objects_by_class"].get(ROBOT_CLASS, [])
-        if not r:
-            time.sleep(0.05)
+def _overlay(robot: Robot, rx: float, ry: float,
+             tx: float, ty: float) -> None:
+    """
+    Update the camera preview path overlay:
+      robot → heading-arrow-tip (80 px) → target
+    This draws the heading direction and the target in the same pass.
+    """
+    det = robot._evaluator._detector
+    if not hasattr(det, "set_current_path"):
+        return
+    if _heading is not None:
+        tip = [int(rx + _heading[0] * 80), int(ry + _heading[1] * 80)]
+        det.set_current_path([[int(rx), int(ry)], tip, [int(tx), int(ty)]])
+    else:
+        det.set_current_path([[int(rx), int(ry)], [int(tx), int(ty)]])
+
+
+# ── Core navigation ───────────────────────────────────────────────────────────
+
+def _navigate_to(robot: Robot, tx: float, ty: float,
+                 approach_px: float, track_ball: bool = False) -> bool:
+    """
+    Simplest possible controller — no A*, no potential field:
+
+      Each iteration:
+        1. Read robot position.
+        2. If track_ball: snap target to nearest currently-visible ball.
+        3. Log: position, heading, target, dist, bearing, error.
+        4. If dist < approach_px → ARRIVED.
+        5. If heading unknown → FORWARD to bootstrap heading.
+        6. If |error| <= _ALIGN_DEG → FORWARD (aligned).
+        7. Else:
+             a. If _right_is_cw unknown → calibrate (RIGHT + probe FORWARD).
+             b. Otherwise → turn in the correct direction.
+             After turning, do ONE probe FORWARD to re-measure heading.
+
+    Heading is stored in the module-level _heading so it persists across calls.
+    """
+    global _heading, _right_is_cw
+    cal_tries = 0
+
+    for step in range(300):
+
+        # ── 1. Read position ─────────────────────────────────────────────────
+        rx, ry, state = _read_pos(robot)
+        if rx is None:
+            log.warning("[nav %03d] Robot not detected — waiting", step)
+            time.sleep(0.1)
             continue
 
-        rx, ry = float(r[0]["cx"]), float(r[0]["cy"])
-        dist   = math.hypot(tx - rx, ty - ry)
+        # ── 2. Refresh target from nearest visible ball ──────────────────────
+        if track_ball:
+            fresh = _all_balls(state)
+            if fresh:
+                nb = min(fresh,
+                         key=lambda b: math.hypot(float(b["cx"]) - rx,
+                                                  float(b["cy"]) - ry))
+                ntx, nty = float(nb["cx"]), float(nb["cy"])
+                if abs(ntx - tx) > 3 or abs(nty - ty) > 3:
+                    log.info("  Retarget (%.0f,%.0f) → (%.0f,%.0f)",
+                             tx, ty, ntx, nty)
+                tx, ty = ntx, nty
 
-        if hasattr(detector, "set_current_path"):
-            detector.set_current_path([[int(rx), int(ry)], [int(tx), int(ty)]])
+        # ── 3. Compute metrics ───────────────────────────────────────────────
+        dist = math.hypot(tx - rx, ty - ry)
+        bearing_deg = math.degrees(math.atan2(ty - ry, tx - rx))
+        hdg_deg = (math.degrees(math.atan2(_heading[1], _heading[0]))
+                   if _heading else None)
+        error = _bearing_error(tx, ty, rx, ry) if _heading else None
 
-        log.info("drive_to: pos=(%.0f,%.0f)  dist=%.0fpx  hdg=%s",
-                 rx, ry, dist,
-                 "(%.2f,%.2f)" % heading if heading else "?")
+        log.info(
+            "[nav %03d] "
+            "Pos:(%.0f,%.0f)  Hdg:%s  "
+            "Target:(%.0f,%.0f)  Dist:%.0fpx  "
+            "Bearing:%.0f°  Error:%s  CW:%s",
+            step,
+            rx, ry,
+            f"{hdg_deg:.0f}°" if hdg_deg is not None else "?",
+            tx, ty, dist,
+            bearing_deg,
+            f"{error:.1f}°" if error is not None else "?",
+            _right_is_cw,
+        )
 
+        _overlay(robot, rx, ry, tx, ty)
+
+        # ── 4. Arrival check ─────────────────────────────────────────────────
         if dist < approach_px:
+            log.info("  ✓ ARRIVED  dist=%.0f < %.0f px", dist, approach_px)
             return True
 
-        # ── 2. Bootstrap: drive forward once to get initial heading ─────────
-        if heading is None:
-            robot.send("forward")
-            s2 = robot.assess()
-            r2 = s2["objects_by_class"].get(ROBOT_CLASS, [])
-            if r2:
-                rx2, ry2 = float(r2[0]["cx"]), float(r2[0]["cy"])
-                d = math.hypot(rx2 - rx, ry2 - ry)
-                if d >= _NOISE_PX:
-                    heading = ((rx2 - rx) / d, (ry2 - ry) / d)
-                    log.info("  Bootstrap heading: (%.2f, %.2f)", *heading)
+        # ── 5. Bootstrap: drive forward once to get initial heading ──────────
+        if _heading is None:
+            log.info("  Action: BOOTSTRAP_FORWARD (heading unknown)")
+            _send(robot, "forward")
+            rx2, ry2, _ = _read_pos(robot)
+            if rx2 is not None:
+                _store_heading(rx, ry, rx2, ry2)
             continue
 
-        # ── 3. Angular error using potential-field steering direction ───────
-        dx, dy    = _steer_direction(rx, ry, tx, ty, state)
-        cross     = heading[0] * dy - heading[1] * dx
-        dot       = heading[0] * dx + heading[1] * dy
-        error_deg = math.degrees(math.atan2(cross, dot))
-        log.info("  error=%.1f°", error_deg)
+        # ── 6. Aligned: drive forward ────────────────────────────────────────
+        if abs(error) <= _ALIGN_DEG:
+            log.info("  Action: FORWARD  (error=%.1f° within ±%.0f°)",
+                     error, _ALIGN_DEG)
+            _send(robot, "forward")
+            rx2, ry2, _ = _read_pos(robot)
+            if rx2 is not None:
+                _store_heading(rx, ry, rx2, ry2)
+            continue
 
-        # ── 4. Misaligned: turn first ────────────────────────────────────────
-        if abs(error_deg) > _ALIGN_DEG:
-            if _right_is_cw is None:
-                # One-time calibration: probe with "right" then forward
-                h_before = heading
-                robot.send("right")
-                sc1 = robot.assess()
-                rc1 = sc1["objects_by_class"].get(ROBOT_CLASS, [])
-                if not rc1:
-                    continue
-                rxc, ryc = float(rc1[0]["cx"]), float(rc1[0]["cy"])
-                robot.send("forward")
-                sc2 = robot.assess()
-                rc2 = sc2["objects_by_class"].get(ROBOT_CLASS, [])
-                if not rc2:
-                    continue
-                rxc2, ryc2 = float(rc2[0]["cx"]), float(rc2[0]["cy"])
-                d = math.hypot(rxc2 - rxc, ryc2 - ryc)
-                if d >= _NOISE_PX:
-                    h_after      = ((rxc2 - rxc) / d, (ryc2 - ryc) / d)
-                    cal_cross    = h_before[0] * h_after[1] - h_before[1] * h_after[0]
-                    _right_is_cw = cal_cross > 0
-                    heading      = h_after
-                    log.info("  Calibrated: right_is_cw=%s (cross=%.3f)",
-                             _right_is_cw, cal_cross)
+        # ── 7. Misaligned: turn ──────────────────────────────────────────────
+        need_cw = error > 0   # positive error = target is right = need CW turn
+
+        # 7a. Calibrate polarity (once per run)
+        if _right_is_cw is None:
+            cal_tries += 1
+            if cal_tries > 6:
+                log.error("  Calibration failed %d× — forcing right_is_cw=True",
+                          cal_tries)
+                _right_is_cw = True
                 continue
 
-            # Steer with calibrated polarity
-            need_cw  = error_deg > 0
-            turn_cmd = ("right" if need_cw else "left") if _right_is_cw \
-                  else ("left"  if need_cw else "right")
-            robot.send(turn_cmd)
+            log.info("  Action: CALIBRATE [try %d]  RIGHT + probe FORWARD",
+                     cal_tries)
+            h_before = _heading
 
-            # Probe forward to get ground-truth heading (no dead reckoning)
-            sp1 = robot.assess()
-            rp1 = sp1["objects_by_class"].get(ROBOT_CLASS, [])
-            if rp1:
-                rxp, ryp = float(rp1[0]["cx"]), float(rp1[0]["cy"])
-                robot.send("forward")
-                sp2 = robot.assess()
-                rp2 = sp2["objects_by_class"].get(ROBOT_CLASS, [])
-                if rp2:
-                    rxp2, ryp2 = float(rp2[0]["cx"]), float(rp2[0]["cy"])
-                    dp = math.hypot(rxp2 - rxp, ryp2 - ryp)
-                    if dp >= _NOISE_PX:
-                        heading = ((rxp2 - rxp) / dp, (ryp2 - ryp) / dp)
-                        log.info("  Heading after turn (real): (%.2f, %.2f)", *heading)
+            # Send right turn
+            _send(robot, "right")
+            rxc, ryc, _ = _read_pos(robot)
+            if rxc is None:
+                continue
+
+            # Probe forward to measure heading direction after the turn
+            _send(robot, "forward")
+            rxc2, ryc2, _ = _read_pos(robot)
+            if rxc2 is None:
+                continue
+
+            if _store_heading(rxc, ryc, rxc2, ryc2):
+                # cross product h_before × h_after:
+                #   > 0 → heading rotated CW → "right" is CW
+                #   < 0 → heading rotated CCW → "right" is CCW
+                cross = h_before[0] * _heading[1] - h_before[1] * _heading[0]
+                _right_is_cw = cross > 0
+                log.info(
+                    "  Calibrated: right_is_cw=%s  cross=%.3f  "
+                    "before=%.0f°  after=%.0f°",
+                    _right_is_cw, cross,
+                    math.degrees(math.atan2(h_before[1], h_before[0])),
+                    math.degrees(math.atan2(_heading[1], _heading[0])),
+                )
             continue
 
-        # ── 5. Aligned: drive forward and update heading ─────────────────────
-        robot.send("forward")
-        s3 = robot.assess()
-        r3 = s3["objects_by_class"].get(ROBOT_CLASS, [])
-        if r3:
-            rx3, ry3 = float(r3[0]["cx"]), float(r3[0]["cy"])
-            d = math.hypot(rx3 - rx, ry3 - ry)
-            if d >= _NOISE_PX:
-                heading = ((rx3 - rx) / d, (ry3 - ry) / d)
-                log.info("  Heading from disp: (%.2f, %.2f)  d=%.1fpx", *heading, d)
+        # 7b. Turn toward the target
+        #   need_cw=T, right_is_cw=T → "right"   need_cw=T, right_is_cw=F → "left"
+        #   need_cw=F, right_is_cw=T → "left"    need_cw=F, right_is_cw=F → "right"
+        turn = "right" if (need_cw == _right_is_cw) else "left"
+        log.info("  Action: TURN_%s  (error=%.1f°, need_cw=%s, right_is_cw=%s)",
+                 turn.upper(), error, need_cw, _right_is_cw)
+        _send(robot, turn)
 
-    log.warning("_drive_to: max steps reached.")
+        # Probe FORWARD to re-measure heading after the turn.
+        # This is intentional: we need the robot to move in order to observe
+        # the new heading direction from its displacement.
+        rxp, ryp, _ = _read_pos(robot)
+        if rxp is not None:
+            log.info("  Probe FORWARD to re-measure heading after turn")
+            _send(robot, "forward")
+            rxp2, ryp2, _ = _read_pos(robot)
+            if rxp2 is not None:
+                _store_heading(rxp, ryp, rxp2, ryp2)
+
+    log.warning("_navigate_to: 300 steps exhausted without arriving")
     return False
 
 
-def _all_balls(state: dict) -> list:
-    return [d for cls in BALL_CLASSES for d in state["objects_by_class"].get(cls, [])]
-
-
-def _plan_sequence(balls: list, start: tuple) -> list:
-    """
-    Greedy nearest-neighbour ordering of all balls from start position.
-    Returns a new list ordered closest-first.
-    """
-    remaining = list(balls)
-    ordered = []
-    pos = start
-    while remaining:
-        nearest = min(remaining, key=lambda d: math.hypot(
-            d["cx"] - pos[0], d["cy"] - pos[1]))
-        ordered.append(nearest)
-        pos = (nearest["cx"], nearest["cy"])
-        remaining.remove(nearest)
-    return ordered
-
-
-def _show_route(robot: Robot, start: tuple, balls: list) -> None:
-    """Draw the full planned route through all remaining balls in the preview."""
-    pts = [[int(start[0]), int(start[1])]]
-    for b in balls:
-        pts.append([int(b["cx"]), int(b["cy"])])
-    detector = robot._evaluator._detector
-    if hasattr(detector, "set_current_path"):
-        detector.set_current_path(pts)
-
+# ── Autonomous mission ────────────────────────────────────────────────────────
 
 def run_autonomous(robot: Robot) -> None:
-    global _right_is_cw
-    _right_is_cw = None   # re-calibrate turn direction at the start of each run
+    global _heading, _right_is_cw
+    _heading = None
+    _right_is_cw = None
 
-    log.info("Waiting 3 s for camera to warm up...")
+    log.info("Waiting 3 s for camera warmup…")
     time.sleep(3.0)
+    _send(robot, "open_gripper")
+    time.sleep(0.3)
 
-    robot.send("open_gripper")
-    time.sleep(0.5)
+    fsm: RobotState = RobotState.SEARCH_BALL
+    ball_target: tuple | None = None
+    goal_target: tuple | None = None
 
-    log.info("Autonomous collection started.")
+    log.info("=== Autonomous mission start  state=%s ===", fsm.name)
 
-    while True:
-        state = robot.assess()
-        balls = _all_balls(state)
+    while fsm != RobotState.DONE:
+        log.info("--- [FSM: %s] ---", fsm.name)
 
-        if not balls:
-            log.info("No balls detected — mission complete!")
-            break
+        # ── SEARCH_BALL ──────────────────────────────────────────────────────
+        if fsm == RobotState.SEARCH_BALL:
+            frame = robot.assess()
+            balls = _all_balls(frame)
 
-        robot_dets = state["objects_by_class"].get(ROBOT_CLASS, [])
-        if not robot_dets:
-            time.sleep(0.2)
-            continue
-
-        robot_pos = (float(robot_dets[0]["cx"]), float(robot_dets[0]["cy"]))
-
-        # ── Plan one route through all balls, closest first ─────────────────
-        sequence = _plan_sequence(balls, robot_pos)
-        log.info("Route planned: %d balls", len(sequence))
-        _show_route(robot, robot_pos, sequence)
-
-        # ── Follow the route ─────────────────────────────────────────────────
-        for i, ball in enumerate(sequence):
-            # Update preview to show only remaining balls in route
-            state = robot.assess()
-            robot_dets = state["objects_by_class"].get(ROBOT_CLASS, [])
-            if robot_dets:
-                robot_pos = (float(robot_dets[0]["cx"]), float(
-                    robot_dets[0]["cy"]))
-                _show_route(robot, robot_pos, sequence[i:])
-
-            target = (float(ball["cx"]), float(ball["cy"]))
-            log.info("Ball %d/%d at (%.0f, %.0f)",
-                     i + 1, len(sequence), *target)
-
-            # ── 1. Navigate to just outside gripper range ────────────────────
-            if not _drive_to(robot, *target, approach_px=90):
-                log.warning("Could not reach ball %d — skipping.", i + 1)
+            if not balls:
+                log.info("No balls visible — mission complete!")
+                fsm = _transition(fsm, RobotState.DONE, "(no balls)")
                 continue
 
-            # ── 2. Open gripper, advance to seat ball, then close ────────────
-            log.info("Gripping ball...")
-            robot.send("open_gripper")
-            time.sleep(0.3)           # let gripper fully open
-            robot.send("forward")     # advance ball into open gripper arms
-            robot.send("close_gripper")
+            robot_dets = frame["objects_by_class"].get(ROBOT_CLASS, [])
+            if not robot_dets:
+                log.warning("Robot not detected — retrying")
+                time.sleep(0.2)
+                continue
 
-            # ── 3. Find goal — spin until one is visible ──────────────────────
-            log.info("Looking for goal...")
-            goal_pos = None
-            for _ in range(24):          # up to ~360° of search
-                state = robot.assess()
-                goal_cls = _pick_goal(state)
+            rx = float(robot_dets[0]["cx"])
+            ry = float(robot_dets[0]["cy"])
+            nearest = min(
+                balls,
+                key=lambda b: math.hypot(
+                    float(b["cx"]) - rx, float(b["cy"]) - ry),
+            )
+            ball_target = (float(nearest["cx"]), float(nearest["cy"]))
+            dist = math.hypot(ball_target[0] - rx, ball_target[1] - ry)
+            log.info("Target ball: (%.0f,%.0f)  dist=%.0f px  [%d balls]",
+                     *ball_target, dist, len(balls))
+            fsm = _transition(fsm, RobotState.APPROACH_BALL,
+                              f"target={ball_target}")
+
+        # ── APPROACH_BALL ────────────────────────────────────────────────────
+        elif fsm == RobotState.APPROACH_BALL:
+            assert ball_target is not None
+            log.info("Navigating to ball (%.0f,%.0f)  approach=%.0f px",
+                     *ball_target, _APPROACH_BALL_PX)
+            arrived = _navigate_to(robot, *ball_target,
+                                   approach_px=_APPROACH_BALL_PX,
+                                   track_ball=True)
+            if arrived:
+                fsm = _transition(fsm, RobotState.PICKUP, "(arrived)")
+            else:
+                log.warning("Could not reach ball — re-searching")
+                fsm = _transition(fsm, RobotState.SEARCH_BALL, "(nav failed)")
+
+        # ── PICKUP ───────────────────────────────────────────────────────────
+        elif fsm == RobotState.PICKUP:
+            log.info("Gripping ball…")
+            _send(robot, "open_gripper")
+            time.sleep(0.3)
+            _send(robot, "forward")       # seat ball into gripper arms
+            _send(robot, "close_gripper")
+            log.info("Ball gripped.")
+            fsm = _transition(fsm, RobotState.SEARCH_GOAL)
+
+        # ── SEARCH_GOAL ──────────────────────────────────────────────────────
+        elif fsm == RobotState.SEARCH_GOAL:
+            log.info("Searching for goal (up to 360° spin)…")
+            goal_target = None
+            for spin in range(24):
+                frame = robot.assess()
+                goal_cls = _pick_goal(frame)
                 if goal_cls:
-                    dets = state["objects_by_class"].get(goal_cls, [])
+                    dets = frame["objects_by_class"].get(goal_cls, [])
                     if dets:
-                        goal_pos = (float(dets[0]["cx"]), float(dets[0]["cy"]))
-                        log.info("Goal found: %s at (%.0f, %.0f)",
-                                 goal_cls, *goal_pos)
+                        goal_target = (
+                            float(dets[0]["cx"]), float(dets[0]["cy"]))
+                        log.info("Goal '%s' at (%.0f,%.0f) after %d spins",
+                                 goal_cls, *goal_target, spin)
                         break
-                robot.send("right")
+                log.info("  Spin %d: no goal visible", spin)
+                _send(robot, "right")
 
-            if goal_pos is None:
-                log.warning("Goal not found — dropping ball and continuing.")
-                robot.send("open_gripper")
-                continue
+            if goal_target is None:
+                log.warning("Goal not found — dropping ball and resetting")
+                _send(robot, "open_gripper")
+                fsm = _transition(fsm, RobotState.SEARCH_BALL,
+                                  "(goal not found, ball dropped)")
+            else:
+                fsm = _transition(fsm, RobotState.APPROACH_GOAL,
+                                  f"goal={goal_target}")
 
-            # ── 4. Drive to goal ──────────────────────────────────────────────
-            _drive_to(robot, *goal_pos)
+        # ── APPROACH_GOAL ────────────────────────────────────────────────────
+        elif fsm == RobotState.APPROACH_GOAL:
+            assert goal_target is not None
+            log.info("Navigating to goal (%.0f,%.0f)  approach=%.0f px",
+                     *goal_target, _APPROACH_GOAL_PX)
+            arrived = _navigate_to(robot, *goal_target,
+                                   approach_px=_APPROACH_GOAL_PX)
+            if arrived:
+                fsm = _transition(fsm, RobotState.DROP, "(arrived)")
+            else:
+                log.warning("Could not reach goal — re-searching")
+                fsm = _transition(fsm, RobotState.SEARCH_GOAL, "(nav failed)")
 
-            # ── 5. Deposit and back away ──────────────────────────────────────
-            log.info("Depositing ball.")
-            robot.send("open_gripper")
-            robot.send("backward")
-            robot.send("backward")
+        # ── DROP ─────────────────────────────────────────────────────────────
+        elif fsm == RobotState.DROP:
+            log.info("Depositing ball at goal.")
+            _send(robot, "open_gripper")
+            _send(robot, "backward")
+            _send(robot, "backward")
+            log.info("Ball deposited.")
+            fsm = _transition(fsm, RobotState.SEARCH_BALL, "(ready for next)")
 
-        # Loop back: replan from new position with any remaining/new balls
+    log.info("=== Mission complete ===")
 
 
 if __name__ == "__main__":
     camera = Camera()
     robot = Robot(detector=camera._detector, backend=_ev3_backend)
 
-    camera.start_detection(model_path="best.pt", confidence=0.15)
+    camera.start_detection(model_path="best.pt", confidence=0.40)
     camera.preview()
 
     try:
