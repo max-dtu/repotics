@@ -24,12 +24,16 @@ CLASSES_OF_INTEREST = set(["ball", "car"])
 _CLASSES_OF_INTEREST_str = ",".join(CLASSES_OF_INTEREST)
 
 DEFAULT_PROMPT = (
-    f'You control a robot by choosing the best available command from [{_cmds_str}] based on the current task and the camera frame. '
-    f'Current task: {{task}} See the camera frame, detect {_CLASSES_OF_INTEREST_str}; evaluate; and then respond. '
-    'If unsure which command to choose, choose left or right command randomly. '
-    'Also decide whether the task is already complete. If the task is complete, set "task_done" to true. '
-    'Identify which of the visible objects of interest is closest to the robot. '
-    'Reply only with compact JSON in this exact shape: {"command":"...","task_done":true|false,"visible_objects_of_interest":[...],"object_closest_to_robot":"..."}'
+    "You control a robot car on a 2D field. You are provided with:\n"
+    "1. The Active Task: {task}\n"
+    "2. The Last Executed Command: {last_command} (If this is the first step, the last command is 'none')\n"
+    "3. Previous Frame (before the command was executed)\n"
+    "4. Current Frame (after the command was executed)\n\n"
+    f"First, locate the robot car and the ball in both frames. If the last command was not 'none', compare the Previous Frame and Current Frame to evaluate if the command improved, degraded, or did not change progress towards the task (e.g. by decreasing or increasing the 2D distance between the car and the ball). If progress degraded, you MUST choose the opposite/inverse command of the last command to undo the move and recover (opposite of forward is backward, backward is forward, left is right, right is left, open_gripper is close_gripper, close_gripper is open_gripper).\n"
+    f"Otherwise, choose the best command from [{_cmds_str}] to make progress towards the task.\n\n"
+    "Identify which of the visible objects of interest is closest to the robot. "
+    "Reply only with compact JSON in this exact shape: "
+    '{"evaluation":"improved|degraded|no_change","command":"...","task_done":true|false,"visible_objects_of_interest":[...],"object_closest_to_robot":"..."}'
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +45,7 @@ class VisionDecision:
     task_done: bool = False
     visible_objects_of_interest: set[str] | None = None
     objects_of_interest_closest: str | None = None
+    evaluation: str | None = None
     raw_output: str = ""
 
 
@@ -198,13 +203,14 @@ def parse_decision(text: str) -> VisionDecision:
             task_done=data.get("task_done") if isinstance(data.get("task_done"), bool) else False,
             visible_objects_of_interest=visible_set,
             objects_of_interest_closest=closest_str,
+            evaluation=data.get("evaluation"),
             raw_output=text,
         )
 
     return VisionDecision(command=parse_command(text), raw_output=text)
 
 
-def query_gemini(api_key: str, model: str, base64_image: str, prompt: str) -> str:
+def query_gemini(api_key: str, model: str, prev_base64_image: str, curr_base64_image: str, prompt: str) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     headers = {
         "Content-Type": "application/json"
@@ -213,13 +219,21 @@ def query_gemini(api_key: str, model: str, base64_image: str, prompt: str) -> st
         "contents": [
             {
                 "parts": [
-                    {"text": prompt},
+                    {"text": "Previous Frame (before executing the last command):"},
                     {
                         "inlineData": {
                             "mimeType": "image/jpeg",
-                            "data": base64_image
+                            "data": prev_base64_image
                         }
-                    }
+                    },
+                    {"text": "Current Frame (after executing the last command):"},
+                    {
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
+                            "data": curr_base64_image
+                        }
+                    },
+                    {"text": prompt}
                 ]
             }
         ],
@@ -237,7 +251,7 @@ def query_gemini(api_key: str, model: str, base64_image: str, prompt: str) -> st
         raise RuntimeError(f"Unexpected response structure from Gemini API: {result}") from e
 
 
-def query_openai(api_key: str, model: str, base64_image: str, prompt: str) -> str:
+def query_openai(api_key: str, model: str, prev_base64_image: str, curr_base64_image: str, prompt: str) -> str:
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -250,13 +264,21 @@ def query_openai(api_key: str, model: str, base64_image: str, prompt: str) -> st
             {
                 "role": "user",
                 "content": [
-                    {"text": prompt},
+                    {"type": "text", "text": "Previous Frame (before executing the last command):"},
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
+                            "url": f"data:image/jpeg;base64,{prev_base64_image}"
                         }
-                    }
+                    },
+                    {"type": "text", "text": "Current Frame (after executing the last command):"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{curr_base64_image}"
+                        }
+                    },
+                    {"type": "text", "text": prompt}
                 ]
             }
         ]
@@ -321,6 +343,9 @@ def run(args) -> None:
         # Warmup delay for camera exposure auto-adjustment
         time.sleep(1.0)
         
+        prev_base64_image = None
+        last_command = "none"
+        
         while args.max_steps is None or steps < args.max_steps:
             started_at = time.monotonic()
             frame = camera.get_frame(timeout=args.timeout)
@@ -328,16 +353,22 @@ def run(args) -> None:
             save_latest_frame(image, args.save_latest_frame)
             
             base64_image = image_to_base64(image)
+            
+            # First frame scenario
+            if prev_base64_image is None:
+                prev_base64_image = base64_image
+                
             prompt = build_task_prompt(args.prompt, task)
+            prompt = prompt.replace("{last_command}", last_command)
             
             logger.info("Model string input (prompt):\n%s", prompt)
             
             # Query VLM API
             try:
                 if is_openai:
-                    raw_output = query_openai(openai_key, args.model, base64_image, prompt)
+                    raw_output = query_openai(openai_key, args.model, prev_base64_image, base64_image, prompt)
                 else:
-                    raw_output = query_gemini(gemini_key, args.model, base64_image, prompt)
+                    raw_output = query_gemini(gemini_key, args.model, prev_base64_image, base64_image, prompt)
             except Exception as e:
                 logger.error("API request failed: %s", e)
                 steps += 1
@@ -348,12 +379,13 @@ def run(args) -> None:
             command = decision.command
 
             logger.info(
-                "Vision decision: task=%r done=%s command=%s objects_visible=%s closest_object=%s",
+                "Vision decision: task=%r done=%s command=%s objects_visible=%s closest_object=%s evaluation=%s",
                 task,
                 decision.task_done,
                 command,
                 decision.visible_objects_of_interest,
                 decision.objects_of_interest_closest or "<none>",
+                decision.evaluation or "<none>",
             )
             logger.info(wrap_stand_out("Model raw output", decision.raw_output))
             if args.save_latest_frame:
@@ -361,6 +393,8 @@ def run(args) -> None:
 
             if decision.task_done:
                 logger.info("Task complete: %s", task)
+                prev_base64_image = None
+                last_command = "none"
                 if not args.ask_task:
                     break
                 task = ask_for_task()
@@ -377,6 +411,13 @@ def run(args) -> None:
                     logger.info("Sent: %s", command)
                 else:
                     logger.error("Failed to send: %s", command)
+                
+                # Update history for next step
+                prev_base64_image = base64_image
+                last_command = command
+            else:
+                prev_base64_image = base64_image
+                last_command = "none"
 
             steps += 1
             elapsed = time.monotonic() - started_at
