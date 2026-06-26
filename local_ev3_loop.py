@@ -37,10 +37,18 @@ _CLASSES_OF_INTEREST_str = ",".join(CLASSES_OF_INTEREST)
 # Available choices e.g.: "InternRobotics/RoboInter-VLM", "Qwen/Qwen2.5-VL-7B-Instruct", "Qwen/Qwen2-VL-2B-Instruct, Qwen/Qwen2.5-VL-3B-Instruct"
 DEFAULT_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
 DEFAULT_PROMPT = (
-    f'You control a robot by choosing the best available command from [{_cmds_str}] based on the current task and the camera frame. Current task: {{task}} See the camera frame, detect {_CLASSES_OF_INTEREST_str}; evaluate; and then respond. If unsure which command to choose, choose left or right command randomly. '
-    'Also decide whether the task is already complete. If the task is complete, set "task_done" to true. '
-    'Identify which of the visible objects of interest is closest to the robot. '
-    'Reply only with compact JSON in this exact shape: {"command":"...","task_done":true|false,"visible_objects_of_interest":[...],"object_closest_to_robot":"..."}'
+    f"You control a robot to perform the task: '{{task}}'. "
+    f"You are shown either the current top-down camera frame (Frame 1) or two consecutive top-down camera frames (Frame 1 is the last frame, Frame 2 is the current frame). "
+    f"The front of the robot is distinguished by a gripper/fork (forklift structure) attached to it. The robot's primary objective is to align its front (gripper) to directly face the ball before moving towards it. "
+    f"The last executed command was '{{last_command}}'. "
+    f"If two frames are shown, compare Frame 1 and Frame 2 to evaluate the effect of the last command '{{last_command}}': "
+    f"- If the robot is STUCK (no movement/difference between Frame 1 and Frame 2) or progress DEGRADED (the robot moved further away from the ball, or turned further away from facing the ball), you MUST select the opposite command to undo it (opposite commands: forward <-> backward, left <-> right). "
+    f"- If the robot successfully made progress (moved closer to the ball, or rotated closer to facing the ball, even if not fully aligned yet), do NOT undo it; continue with the next best command to make further progress. "
+    f"Otherwise, select the next best command from [{_cmds_str}] to rotate (left/right) or move (forward/backward) so the front gripper faces the ball. "
+    f"Also decide whether the task is already complete (set 'task_done' to true/false). "
+    f"Identify which of the visible objects of interest [{_CLASSES_OF_INTEREST_str}] is closest to the robot. "
+    f"Reply only with compact JSON in this exact shape: "
+    f'{{"command":"...","task_done":true|false,"visible_objects_of_interest":[...],"object_closest_to_robot":"...","progress_evaluation":"...","gripper_identified":true|false,"gripper_orientation":"describe where the gripper is pointing relative to the ball"}}'
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +60,9 @@ class VisionDecision:
     task_done: bool = False
     visible_objects_of_interest: set[str] | None = None
     objects_of_interest_closest: str | None = None
+    progress_evaluation: str | None = None
+    gripper_identified: bool = False
+    gripper_orientation: str | None = None
     raw_output: str = ""
 
 
@@ -206,11 +217,20 @@ def parse_decision(text: str) -> VisionDecision:
         closest = data.get("object_closest_to_robot")
         closest_str = str(closest).strip() if closest is not None else None
 
+        # Parse gripper fields
+        gripper_id = data.get("gripper_identified")
+        gripper_identified = bool(gripper_id) if gripper_id is not None else False
+        gripper_orientation = data.get("gripper_orientation")
+        gripper_orientation_str = str(gripper_orientation).strip() if gripper_orientation is not None else None
+
         return VisionDecision(
             command=command,
             task_done=data.get("task_done") if isinstance(data.get("task_done"), bool) else False,
             visible_objects_of_interest=visible_set,
             objects_of_interest_closest=closest_str,
+            progress_evaluation=data.get("progress_evaluation"),
+            gripper_identified=gripper_identified,
+            gripper_orientation=gripper_orientation_str,
             raw_output=text,
         )
 
@@ -231,10 +251,20 @@ def model_input_device(model):
         return torch.device("cpu")
 
 
-def build_task_prompt(prompt_template: str, task: str) -> str:
-    if "{task}" in prompt_template:
-        return prompt_template.replace("{task}", task)
-    return f"{prompt_template}\nCurrent task: {task}"
+def build_task_prompt(prompt_template: str, task: str, last_command: str | None = None) -> str:
+    prompt = prompt_template
+    if "{task}" in prompt:
+        prompt = prompt.replace("{task}", task)
+    else:
+        prompt = f"{prompt}\nCurrent task: {task}"
+        
+    last_cmd_str = last_command if last_command is not None else "None (first step)"
+    if "{last_command}" in prompt:
+        prompt = prompt.replace("{last_command}", last_cmd_str)
+    else:
+        prompt = f"{prompt}\nLast command executed: {last_cmd_str}"
+        
+    return prompt
 
 
 def ask_for_task(default_task: str | None = None) -> str | None:
@@ -248,22 +278,40 @@ def ask_for_task(default_task: str | None = None) -> str | None:
     return default_task
 
 
-def choose_command(model, processor, image: Image.Image, prompt: str) -> VisionDecision:
+def choose_command(
+    model,
+    processor,
+    image: Image.Image,
+    prompt: str,
+    last_image: Image.Image | None = None,
+) -> VisionDecision:
     import torch
     from qwen_vl_utils import process_vision_info
+
+    content = []
+    if last_image is not None:
+        content.append(
+            {
+                "type": "image",
+                "image": last_image,
+                "resized_width": last_image.width,
+                "resized_height": last_image.height,
+            }
+        )
+    content.append(
+        {
+            "type": "image",
+            "image": image,
+            "resized_width": image.width,
+            "resized_height": image.height,
+        }
+    )
+    content.append({"type": "text", "text": prompt})
 
     messages = [
         {
             "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image,
-                    "resized_width": image.width,
-                    "resized_height": image.height,
-                },
-                {"type": "text", "text": prompt},
-            ],
+            "content": content,
         }
     ]
     chat_text = processor.apply_chat_template(
@@ -430,21 +478,32 @@ def run(args) -> None:
 
     try:
         camera.open()
+        last_image = None
+        last_command = None
         while args.max_steps is None or steps < args.max_steps:
             started_at = time.monotonic()
             frame = camera.capture(timeout=args.timeout)
             image = frame_to_image(frame, args.width, args.height)
             save_latest_frame(image, args.save_latest_frame)
-            decision = choose_command(model, processor, image, build_task_prompt(args.prompt, task))
+            decision = choose_command(
+                model,
+                processor,
+                image,
+                build_task_prompt(args.prompt, task, last_command),
+                last_image=last_image,
+            )
             command = decision.command
 
             logger.info(
-                "Vision decision: task=%r done=%s command=%s objects_visible=%s closest_object=%s",
+                "Vision decision: task=%r done=%s command=%s objects_visible=%s closest_object=%s evaluation=%s gripper_detected=%s orientation=%s",
                 task,
                 decision.task_done,
                 command,
                 decision.visible_objects_of_interest,
                 decision.objects_of_interest_closest or "<none>",
+                decision.progress_evaluation or "<none>",
+                decision.gripper_identified,
+                decision.gripper_orientation or "<none>",
             )
             logger.info(wrap_stand_out("Model raw output", decision.raw_output))
             if args.save_latest_frame:
@@ -452,6 +511,8 @@ def run(args) -> None:
 
             if decision.task_done:
                 logger.info("Task complete: %s", task)
+                last_image = None
+                last_command = None
                 if not args.ask_task:
                     break
                 task = ask_for_task()
@@ -462,12 +523,25 @@ def run(args) -> None:
                 continue
 
             if command is not None:
+                sent_success = False
                 if args.dry_run:
                     logger.info("Dry run: %s", command)
+                    sent_success = True
                 elif ev3.send(command):
                     logger.info("Sent: %s", command)
+                    sent_success = True
                 else:
                     logger.error("Failed to send: %s", command)
+
+                if sent_success:
+                    last_command = command
+                    last_image = image
+                else:
+                    last_command = None
+                    last_image = None
+            else:
+                last_command = None
+                last_image = None
 
             steps += 1
             elapsed = time.monotonic() - started_at

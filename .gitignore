@@ -6,3 +6,4 @@ __pycache__/
 *.pyo
 *.pt
 qwen_latest_frame.jpg
+*.jpg

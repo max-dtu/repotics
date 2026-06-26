@@ -27,13 +27,17 @@ DEFAULT_PROMPT = (
     "You control a robot car on a 2D field. You are provided with:\n"
     "1. The Active Task: {task}\n"
     "2. The Last Executed Command: {last_command} (If this is the first step, the last command is 'none')\n"
-    "3. Previous Frame (before the command was executed)\n"
-    "4. Current Frame (after the command was executed)\n\n"
-    f"First, locate the robot car and the ball in both frames. If the last command was not 'none', compare the Previous Frame and Current Frame to evaluate if the command improved, degraded, or did not change progress towards the task (e.g. by decreasing or increasing the 2D distance between the car and the ball). If progress degraded, you MUST choose the opposite/inverse command of the last command to undo the move and recover (opposite of forward is backward, backward is forward, left is right, right is left, open_gripper is close_gripper, close_gripper is open_gripper).\n"
-    f"Otherwise, choose the best command from [{_cmds_str}] to make progress towards the task.\n\n"
+    "3. Current Gripper State: {gripper_state} (either 'open' or 'closed')\n"
+    "4. Previous Frame (before the command was executed)\n"
+    "5. Current Frame (after the command was executed)\n\n"
+    "The front of the robot is distinguished by a gripper/fork (forklift structure) attached to it. The robot's primary objective is to align its front (gripper) to directly face the ball before moving towards it.\n"
+    "First, locate the robot car and the ball in both frames. If the last command was not 'none', compare the Previous Frame and Current Frame to evaluate if the command improved, degraded, or did not change progress towards the task (e.g. by decreasing or increasing the 2D distance or improving the alignment between the front gripper and the ball):\n"
+    "- If the robot is STUCK (no movement/difference between the frames) or progress DEGRADED (the robot moved further away from the ball, or turned further away from facing the ball), you MUST choose the opposite/undo command of the last command to recover (opposite of forward is backward, backward is forward, left is right, right is left, open_gripper is close_gripper, close_gripper is open_gripper).\n"
+    "- If the robot successfully made progress (moved closer to the ball, or rotated closer to facing the ball, even if not fully aligned yet), do NOT undo it; continue with the next best command to make further progress.\n"
+    f"Otherwise, choose the best command from [{_cmds_str}] to rotate (left/right) or move (forward/backward) so the front gripper faces the ball.\n\n"
     "Identify which of the visible objects of interest is closest to the robot. "
     "Reply only with compact JSON in this exact shape: "
-    '{"evaluation":"improved|degraded|no_change","command":"...","task_done":true|false,"visible_objects_of_interest":[...],"object_closest_to_robot":"..."}'
+    '{"evaluation":"improved|degraded|no_change","command":"...","task_done":true|false,"visible_objects_of_interest":[...],"object_closest_to_robot":"...","gripper_identified":true|false,"gripper_orientation":"describe where the gripper is pointing relative to the ball"}'
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,8 @@ class VisionDecision:
     visible_objects_of_interest: set[str] | None = None
     objects_of_interest_closest: str | None = None
     evaluation: str | None = None
+    gripper_identified: bool = False
+    gripper_orientation: str | None = None
     raw_output: str = ""
 
 
@@ -198,19 +204,27 @@ def parse_decision(text: str) -> VisionDecision:
         closest = data.get("object_closest_to_robot")
         closest_str = str(closest).strip() if closest is not None else None
 
+        # Parse gripper fields
+        gripper_id = data.get("gripper_identified")
+        gripper_identified = bool(gripper_id) if gripper_id is not None else False
+        gripper_orientation = data.get("gripper_orientation")
+        gripper_orientation_str = str(gripper_orientation).strip() if gripper_orientation is not None else None
+
         return VisionDecision(
             command=command,
             task_done=data.get("task_done") if isinstance(data.get("task_done"), bool) else False,
             visible_objects_of_interest=visible_set,
             objects_of_interest_closest=closest_str,
             evaluation=data.get("evaluation"),
+            gripper_identified=gripper_identified,
+            gripper_orientation=gripper_orientation_str,
             raw_output=text,
         )
 
     return VisionDecision(command=parse_command(text), raw_output=text)
 
 
-def query_gemini(api_key: str, model: str, prev_base64_image: str, curr_base64_image: str, prompt: str) -> str:
+def query_gemini(api_key: str, model: str, prev_base64_image: str, curr_base64_image: str, prompt: str, api_timeout: float = 60.0) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     headers = {
         "Content-Type": "application/json"
@@ -241,7 +255,7 @@ def query_gemini(api_key: str, model: str, prev_base64_image: str, curr_base64_i
             "responseMimeType": "application/json"
         }
     }
-    response = requests.post(url, headers=headers, json=payload, timeout=10.0)
+    response = requests.post(url, headers=headers, json=payload, timeout=api_timeout)
     response.raise_for_status()
     result = response.json()
     try:
@@ -251,12 +265,14 @@ def query_gemini(api_key: str, model: str, prev_base64_image: str, curr_base64_i
         raise RuntimeError(f"Unexpected response structure from Gemini API: {result}") from e
 
 
-def query_openai(api_key: str, model: str, prev_base64_image: str, curr_base64_image: str, prompt: str) -> str:
-    url = "https://api.openai.com/v1/chat/completions"
+def query_openai(api_key: str, model: str, prev_base64_image: str, curr_base64_image: str, prompt: str, api_base: str | None = None, api_timeout: float = 60.0) -> str:
+    base_url = api_base.rstrip("/") if api_base else "https://api.openai.com/v1"
+    url = f"{base_url}/chat/completions"
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
+        "Content-Type": "application/json"
     }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     payload = {
         "model": model,
         "response_format": {"type": "json_object"},
@@ -283,7 +299,7 @@ def query_openai(api_key: str, model: str, prev_base64_image: str, curr_base64_i
             }
         ]
     }
-    response = requests.post(url, headers=headers, json=payload, timeout=10.0)
+    response = requests.post(url, headers=headers, json=payload, timeout=api_timeout)
     response.raise_for_status()
     result = response.json()
     try:
@@ -293,10 +309,68 @@ def query_openai(api_key: str, model: str, prev_base64_image: str, curr_base64_i
         raise RuntimeError(f"Unexpected response structure from OpenAI API: {result}") from e
 
 
-def build_task_prompt(prompt_template: str, task: str) -> str:
-    if "{task}" in prompt_template:
-        return prompt_template.replace("{task}", task)
-    return f"{prompt_template}\nCurrent task: {task}"
+def validate_decision(
+    decision: VisionDecision,
+    last_command: str | None,
+    gripper_open: bool
+) -> str | None:
+    # Level 1 check: Was JSON parsed correctly?
+    if not decision.command:
+        return "Error: Could not parse command from response. Ensure you choose a command from the allowed list."
+
+    # Level 2 check: Gripper physical state constraints
+    if decision.command == "open_gripper" and gripper_open:
+        return "Error: Gripper is already open. You cannot open it again. Please choose a different command (e.g., forward, backward, left, right, or close_gripper)."
+    if decision.command == "close_gripper" and not gripper_open:
+        return "Error: Gripper is already closed. You cannot close it again. Please choose a different command (e.g., forward, backward, left, right, or open_gripper)."
+
+    # Level 3 check: Logical consistency of evaluation vs command
+    if decision.evaluation == "degraded" and last_command is not None and last_command != "none":
+        if decision.command == last_command:
+            opposite_cmd = None
+            if last_command == "forward": opposite_cmd = "backward"
+            elif last_command == "backward": opposite_cmd = "forward"
+            elif last_command == "left": opposite_cmd = "right"
+            elif last_command == "right": opposite_cmd = "left"
+            elif last_command == "open_gripper": opposite_cmd = "close_gripper"
+            elif last_command == "close_gripper": opposite_cmd = "open_gripper"
+            
+            suggestion = f" (e.g., '{opposite_cmd}')" if opposite_cmd else ""
+            return f"Error: You evaluated that progress 'degraded' after executing '{last_command}', but you are trying to execute the exact same command again. This will cause an oscillation or get you further stuck. You must select the opposite/undo command{suggestion} or a different steering/correction command."
+
+    if decision.evaluation == "improved" and last_command is not None and last_command != "none":
+        # Check if the model is trying to undo a successful command
+        opposite_cmd = None
+        if last_command == "forward": opposite_cmd = "backward"
+        elif last_command == "backward": opposite_cmd = "forward"
+        elif last_command == "left": opposite_cmd = "right"
+        elif last_command == "right": opposite_cmd = "left"
+        
+        if decision.command == opposite_cmd:
+            return f"Error: You evaluated that progress 'improved' after '{last_command}', but you are now choosing to undo it with '{decision.command}'. If progress was successful, you should build on it rather than reversing. Please choose a command that continues progress."
+
+    return None
+
+
+def build_task_prompt(prompt_template: str, task: str, last_command: str = "none", gripper_open: bool = True) -> str:
+    prompt = prompt_template
+    if "{task}" in prompt:
+        prompt = prompt.replace("{task}", task)
+    else:
+        prompt = f"{prompt}\nCurrent task: {task}"
+        
+    if "{last_command}" in prompt:
+        prompt = prompt.replace("{last_command}", last_command)
+    else:
+        prompt = f"{prompt}\nLast command executed: {last_command}"
+        
+    gripper_state_str = "open" if gripper_open else "closed"
+    if "{gripper_state}" in prompt:
+        prompt = prompt.replace("{gripper_state}", gripper_state_str)
+    else:
+        prompt = f"{prompt}\nCurrent gripper state: {gripper_state_str}"
+        
+    return prompt
 
 
 def ask_for_task(default_task: str | None = None) -> str | None:
@@ -316,15 +390,23 @@ def run(args) -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    # Validate API key based on selected model
+    is_openai = False
+    if args.api_type == "openai":
+        is_openai = True
+    elif args.api_type == "gemini":
+        is_openai = False
+    else:
+        is_openai = "gpt" in args.model.lower() or (args.api_base is not None and "gemini" not in args.api_base)
+
+    # Validate API key only if using default cloud endpoints
     openai_key = os.environ.get("OPENAI_API_KEY")
     gemini_key = os.environ.get("GEMINI_API_KEY")
 
-    is_openai = "gpt" in args.model.lower()
-    if is_openai and not openai_key:
-        raise ValueError("OPENAI_API_KEY environment variable is required to run OpenAI models.")
-    elif not is_openai and not gemini_key:
-        raise ValueError("GEMINI_API_KEY environment variable is required to run Gemini models.")
+    if not args.api_base:
+        if is_openai and not openai_key:
+            raise ValueError("OPENAI_API_KEY environment variable is required to run cloud OpenAI models.")
+        elif not is_openai and not gemini_key:
+            raise ValueError("GEMINI_API_KEY environment variable is required to run cloud Gemini models.")
 
     camera = FrameReader(index=args.camera_index)
     ev3 = build_ev3_client(args.host, args.port, timeout=args.timeout)
@@ -345,6 +427,7 @@ def run(args) -> None:
         
         prev_base64_image = None
         last_command = "none"
+        gripper_open = True
         
         while args.max_steps is None or steps < args.max_steps:
             started_at = time.monotonic()
@@ -358,34 +441,70 @@ def run(args) -> None:
             if prev_base64_image is None:
                 prev_base64_image = base64_image
                 
-            prompt = build_task_prompt(args.prompt, task)
-            prompt = prompt.replace("{last_command}", last_command)
+            error_msg = None
+            retry_count = 0
+            max_retries = 3
+            decision = None
             
-            logger.info("Model string input (prompt):\n%s", prompt)
-            
-            # Query VLM API
-            try:
-                if is_openai:
-                    raw_output = query_openai(openai_key, args.model, prev_base64_image, base64_image, prompt)
-                else:
-                    raw_output = query_gemini(gemini_key, args.model, prev_base64_image, base64_image, prompt)
-            except Exception as e:
-                logger.error("API request failed: %s", e)
+            while retry_count < max_retries:
+                prompt = build_task_prompt(args.prompt, task, last_command, gripper_open)
+                if error_msg:
+                    # Append compiler feedback to prompt
+                    prompt = (
+                        f"{prompt}\n\n"
+                        f"### HARNESS FEEDBACK (PREVIOUS ATTEMPT FAILED):\n"
+                        f"Your previous response returned the following error:\n"
+                        f"{error_msg}\n"
+                        f"Please correct your reasoning and select a valid command from the allowed list."
+                    )
+                
+                logger.info("Model string input (prompt, attempt %d/%d):\n%s", retry_count + 1, max_retries, prompt)
+                
+                # Query VLM API
+                try:
+                    if is_openai:
+                        raw_output = query_openai(openai_key, args.model, prev_base64_image, base64_image, prompt, api_base=args.api_base, api_timeout=args.api_timeout)
+                    else:
+                        raw_output = query_gemini(gemini_key, args.model, prev_base64_image, base64_image, prompt, api_timeout=args.api_timeout)
+                except requests.exceptions.ConnectionError as e:
+                    logger.critical("Could not connect to the API server at %s. The server may have crashed or is not running. Please check llama-server.", args.api_base or "default endpoint")
+                    raise SystemExit("API Connection Error: Ensure llama-server is running.") from e
+                except Exception as e:
+                    logger.error("API request failed: %s (retrying without appending as model prompt feedback)", e)
+                    retry_count += 1
+                    continue
+
+                decision = parse_decision(raw_output)
+                
+                # Validate decision
+                error_msg = validate_decision(decision, last_command, gripper_open)
+                if error_msg is None:
+                    # Valid decision! Break loop.
+                    break
+                
+                logger.warning("Harness rejected VLM output: %s", error_msg)
+                retry_count += 1
+
+            # If after max retries we still don't have a valid decision, skip this step
+            if decision is None or error_msg is not None:
+                logger.error("Harness failed to get a valid decision after %d attempts. Skipping step.", max_retries)
                 steps += 1
-                time.sleep(max(0.0, interval - (time.monotonic() - started_at)))
+                elapsed = time.monotonic() - started_at
+                time.sleep(max(0.0, interval - elapsed))
                 continue
 
-            decision = parse_decision(raw_output)
             command = decision.command
 
             logger.info(
-                "Vision decision: task=%r done=%s command=%s objects_visible=%s closest_object=%s evaluation=%s",
+                "Vision decision: task=%r done=%s command=%s objects_visible=%s closest_object=%s evaluation=%s gripper_detected=%s orientation=%s",
                 task,
                 decision.task_done,
                 command,
                 decision.visible_objects_of_interest,
                 decision.objects_of_interest_closest or "<none>",
                 decision.evaluation or "<none>",
+                decision.gripper_identified,
+                decision.gripper_orientation or "<none>",
             )
             logger.info(wrap_stand_out("Model raw output", decision.raw_output))
             if args.save_latest_frame:
@@ -395,6 +514,7 @@ def run(args) -> None:
                 logger.info("Task complete: %s", task)
                 prev_base64_image = None
                 last_command = "none"
+                gripper_open = True
                 if not args.ask_task:
                     break
                 task = ask_for_task()
@@ -405,16 +525,27 @@ def run(args) -> None:
                 continue
 
             if command is not None:
+                sent_success = False
                 if args.dry_run:
                     logger.info("Dry run: %s", command)
+                    sent_success = True
                 elif ev3.send(command):
                     logger.info("Sent: %s", command)
+                    sent_success = True
                 else:
                     logger.error("Failed to send: %s", command)
                 
-                # Update history for next step
-                prev_base64_image = base64_image
-                last_command = command
+                if sent_success:
+                    # Update history and physical state tracking
+                    prev_base64_image = base64_image
+                    last_command = command
+                    if command == "open_gripper":
+                        gripper_open = True
+                    elif command == "close_gripper":
+                        gripper_open = False
+                else:
+                    prev_base64_image = base64_image
+                    last_command = "none"
             else:
                 prev_base64_image = base64_image
                 last_command = "none"
@@ -460,6 +591,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to overwrite with the latest resized frame sent to model. Use '' to disable.",
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Decision prompt sent with each frame.")
+    parser.add_argument("--api-base", default=None, help="Custom API base URL (e.g. http://localhost:11434/v1 for Ollama).")
+    parser.add_argument(
+        "--api-type",
+        choices=("openai", "gemini"),
+        default=None,
+        help="API protocol/format to use. If not specified, automatically inferred from model name ('gpt' -> openai, others -> gemini)."
+    )
+    parser.add_argument("--api-timeout", type=float, default=60.0, help="VLM API connection timeout in seconds.")
     return parser
 
 
