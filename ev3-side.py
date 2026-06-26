@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
 """
+#!/usr/bin/env python3
 ev3-side.py — Robot socket server for EV3 (ev3dev, Python 3.5+)
 
 Deploy this file to the EV3 and run:
@@ -14,7 +14,7 @@ matching the Command enum in robot/commands.py.
 HOST            = "0.0.0.0"   # Listen on all interfaces
 PORT            = 9999         # Must match the port used by the MacBook
 DRIVE_SPEED     = -400         # Motor speed for driving (deg/s). Negate if forward drives backward.
-DRIVE_DURATION  = 0.3          # Seconds each drive command runs
+DRIVE_DURATION  = 0.8          # Seconds each drive command runs
 TURN_SPEED      = 300          # Motor speed for turning (deg/s)
 TURN_DURATION   = 0.08          # Seconds each turn command runs. Reduce to turn less per command.
 GRIPPER_SPEED   = 200          # Motor speed for gripper (deg/s)

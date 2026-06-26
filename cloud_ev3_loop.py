@@ -1,43 +1,32 @@
-from functorch.experimental import control_flow
 import argparse
+import base64
 import json
 import logging
 import os
 import socket
 import time
 import urllib.request
+import io
 from dataclasses import dataclass
 from pathlib import Path
 
-# Enable high watermark ratio bypass to allow MPS to use system RAM paging on macOS
-os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
-
 import cv2
 from PIL import Image
+import requests
 
-from camera import Camera
-from robot import Command
+from camera.frame_reader import FrameReader
+from robot.commands import Command, AVAILABLE_COMMANDS
 
+ALLOWED_COMMANDS = set(c.value for c in AVAILABLE_COMMANDS)
+_cmds_str = ", ".join(c.value for c in AVAILABLE_COMMANDS)
 
-AVAILABLE_COMMANDS = [
-    Command.LEFT.value,
-    Command.RIGHT.value,
-    Command.FORWARD.value,
-    Command.BACKWARD.value,
-    Command.OPEN_GRIPPER.value,
-    Command.CLOSE_GRIPPER.value,
-]
-ALLOWED_COMMANDS = set(AVAILABLE_COMMANDS)
-
-_cmds_str = ", ".join(AVAILABLE_COMMANDS)
-
-CLASSES_OF_INTEREST = set(["ball","car"])
+CLASSES_OF_INTEREST = set(["ball", "car"])
 _CLASSES_OF_INTEREST_str = ",".join(CLASSES_OF_INTEREST)
 
-# Available choices e.g.: "InternRobotics/RoboInter-VLM", "Qwen/Qwen2.5-VL-7B-Instruct", "Qwen/Qwen2-VL-2B-Instruct, Qwen/Qwen2.5-VL-3B-Instruct"
-DEFAULT_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
 DEFAULT_PROMPT = (
-    f'You control a robot by choosing the best available command from [{_cmds_str}] based on the current task and the camera frame. Current task: {{task}} See the camera frame, detect {_CLASSES_OF_INTEREST_str}; evaluate; and then respond. If unsure which command to choose, choose left or right command randomly. '
+    f'You control a robot by choosing the best available command from [{_cmds_str}] based on the current task and the camera frame. '
+    f'Current task: {{task}} See the camera frame, detect {_CLASSES_OF_INTEREST_str}; evaluate; and then respond. '
+    'If unsure which command to choose, choose left or right command randomly. '
     'Also decide whether the task is already complete. If the task is complete, set "task_done" to true. '
     'Identify which of the visible objects of interest is closest to the robot. '
     'Reply only with compact JSON in this exact shape: {"command":"...","task_done":true|false,"visible_objects_of_interest":[...],"object_closest_to_robot":"..."}'
@@ -124,14 +113,6 @@ def build_ev3_client(host: str, port: int, timeout: float):
     return EV3TcpClient(host, port, timeout=timeout)
 
 
-def configure_huggingface_cache() -> None:
-    if "HF_HOME" in os.environ:
-        return
-    cache_dir = Path(__file__).resolve().parent / ".cache" / "huggingface"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["HF_HOME"] = str(cache_dir)
-
-
 def frame_to_image(frame, width: int, height: int) -> Image.Image:
     resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
@@ -142,6 +123,12 @@ def save_latest_frame(image: Image.Image, path: str | None) -> None:
     if not path:
         return
     image.save(path)
+
+
+def image_to_base64(image: Image.Image) -> str:
+    buffered = io.BytesIO()
+    image.save(buffered, format="JPEG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
 def wrap_stand_out(label: str, text: str) -> str:
@@ -217,18 +204,71 @@ def parse_decision(text: str) -> VisionDecision:
     return VisionDecision(command=parse_command(text), raw_output=text)
 
 
-def model_input_device(model):
-    import torch
-
-    if hasattr(model, "model"):
-        try:
-            return next(model.model.parameters()).device
-        except StopIteration:
-            pass
+def query_gemini(api_key: str, model: str, base64_image: str, prompt: str) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    headers = {
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
+                            "data": base64_image
+                        }
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+    response = requests.post(url, headers=headers, json=payload, timeout=10.0)
+    response.raise_for_status()
+    result = response.json()
     try:
-        return next(model.parameters()).device
-    except StopIteration:
-        return torch.device("cpu")
+        text = result["candidates"][0]["content"]["parts"][0]["text"]
+        return text
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected response structure from Gemini API: {result}") from e
+
+
+def query_openai(api_key: str, model: str, base64_image: str, prompt: str) -> str:
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    payload = {
+        "model": model,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+    response = requests.post(url, headers=headers, json=payload, timeout=10.0)
+    response.raise_for_status()
+    result = response.json()
+    try:
+        text = result["choices"][0]["message"]["content"]
+        return text
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected response structure from OpenAI API: {result}") from e
 
 
 def build_task_prompt(prompt_template: str, task: str) -> str:
@@ -248,175 +288,23 @@ def ask_for_task(default_task: str | None = None) -> str | None:
     return default_task
 
 
-def choose_command(model, processor, image: Image.Image, prompt: str) -> VisionDecision:
-    import torch
-    from qwen_vl_utils import process_vision_info
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image,
-                    "resized_width": image.width,
-                    "resized_height": image.height,
-                },
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
-    chat_text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    
-    logger.info("Model string input (prompt):\n%s", prompt)
-    logger.info("Model string input (chat_text):\n%s", chat_text)
-
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(
-        text=[chat_text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = inputs.to(model_input_device(model))
-
-    with torch.inference_mode():
-        generated_ids = model.generate(**inputs, max_new_tokens=96, do_sample=False)
-
-    trimmed_ids = [
-        output_ids[len(input_ids) :]
-        for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    output = processor.batch_decode(
-        trimmed_ids,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0]
-    
-    logger.info(wrap_stand_out("Model string output", output))
-    
-    return parse_decision(output)
-
-
-def resolve_torch_dtype(dtype: str, device: str):
-    import torch
-
-    if dtype == "auto":
-        if device == "mps" or (device == "auto" and torch.backends.mps.is_available()):
-            return torch.float16
-        if device == "cpu" or not torch.cuda.is_available():
-            return torch.float32
-        return "auto"
-    if dtype == "float16":
-        return torch.float16
-    if dtype == "float32":
-        return torch.float32
-    if dtype == "bfloat16":
-        return torch.bfloat16
-    raise ValueError(f"Unsupported torch dtype: {dtype}")
-
-
-def resolve_device_map(device: str):
-    if device == "auto":
-        return "auto"
-    if device == "cpu":
-        return {"": "cpu"}
-    if device == "mps":
-        # Offload the visual transformer block (Conv3D) to CPU to avoid MPS not supported crash,
-        # and map everything else to mps.
-        return {
-            "visual": "cpu",
-            "": "mps"
-        }
-    raise ValueError(f"Unsupported device: {device}")
-
-
-def load_model(model_name: str, dtype: str, device: str, local_files_only: bool = False):
-    configure_huggingface_cache()
-
-    import torch
-    # limit threads to prevent system starvation on CPU
-    if device in ("cpu", "mps") or (device == "auto" and not torch.cuda.is_available()):
-        num_cores = os.cpu_count() or 4
-        torch_threads = max(1, num_cores - 2)
-        torch.set_num_threads(torch_threads)
-        logger.info("Set torch CPU threads to %d (system has %d cores) to prevent thread starvation", torch_threads, num_cores)
-
-    from transformers import AutoProcessor, AutoModelForVision2Seq, AutoConfig
-
-    logger.info("Loading %s", model_name)
-    torch_dtype = resolve_torch_dtype(dtype, device)
-    config = AutoConfig.from_pretrained(model_name, local_files_only=local_files_only)
-    if hasattr(config, "text_config") and isinstance(config.text_config, dict):
-        delattr(config, "text_config")
-
-    model = AutoModelForVision2Seq.from_pretrained(
-        model_name,
-        config=config,
-        torch_dtype=torch_dtype,
-        device_map=resolve_device_map(device),
-        local_files_only=local_files_only,
-    )
-
-    # Workaround for MPS not supporting Conv3D & Float16 LayerNorm on CPU:
-    # If the device is MPS, we configure a hybrid CPU-Float32 and MPS-Float16 device map.
-    if device == "mps":
-        # 1. Remove the default accelerate hook from visual submodule to prevent it from moving back to MPS
-        if hasattr(model.visual, "_hf_hook"):
-            from accelerate.hooks import remove_hook_from_module
-            remove_hook_from_module(model.visual, recurse=True)
-
-        # 2. Move the visual submodule to CPU in Float32 to bypass PyTorch CPU LayerNorm Float16 constraint
-        model.visual.to(device="cpu", dtype=torch.float32)
-
-        # 3. Override model.device property so model.generate knows the language model is running on MPS
-        type(model).device = property(lambda self: next(self.model.parameters()).device)
-
-        # 4. Register pre-forward hook to cast inputs to Float32 on CPU when entering visual submodule
-        def move_inputs_to_cpu_float32(module, args, kwargs):
-            new_args = tuple(x.to("cpu", dtype=torch.float32) if isinstance(x, torch.Tensor) and x.is_floating_point() else x for x in args)
-            new_kwargs = {k: v.to("cpu", dtype=torch.float32) if isinstance(v, torch.Tensor) and v.is_floating_point() else v for k, v in kwargs.items()}
-            return new_args, new_kwargs
-
-        # 5. Register forward hook to cast outputs to Float16 and move them back to MPS when leaving visual submodule
-        def move_outputs_to_mps_float16(module, input, output):
-            if isinstance(output, torch.Tensor):
-                return output.to("mps", dtype=torch.float16)
-            elif isinstance(output, tuple):
-                return tuple(x.to("mps", dtype=torch.float16) if isinstance(x, torch.Tensor) else x for x in output)
-            return output
-
-        model.visual.register_forward_pre_hook(move_inputs_to_cpu_float32, with_kwargs=True)
-        model.visual.register_forward_hook(move_outputs_to_mps_float16)
-
-    model.generation_config.temperature = None
-    model.generation_config.top_p = None
-    model.generation_config.top_k = None
-    processor = AutoProcessor.from_pretrained(
-        model_name,
-        local_files_only=local_files_only,
-    )
-    return model, processor
-
-
 def run(args) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    model, processor = load_model(
-        args.model,
-        dtype=args.torch_dtype,
-        device=args.device,
-        local_files_only=args.local_files_only,
-    )
-    camera = Camera(index=args.camera_index)
+    # Validate API key based on selected model
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+
+    is_openai = "gpt" in args.model.lower()
+    if is_openai and not openai_key:
+        raise ValueError("OPENAI_API_KEY environment variable is required to run OpenAI models.")
+    elif not is_openai and not gemini_key:
+        raise ValueError("GEMINI_API_KEY environment variable is required to run Gemini models.")
+
+    camera = FrameReader(index=args.camera_index)
     ev3 = build_ev3_client(args.host, args.port, timeout=args.timeout)
     interval = 1.0 / args.hz
     steps = 0
@@ -430,12 +318,33 @@ def run(args) -> None:
 
     try:
         camera.open()
+        # Warmup delay for camera exposure auto-adjustment
+        time.sleep(1.0)
+        
         while args.max_steps is None or steps < args.max_steps:
             started_at = time.monotonic()
-            frame = camera.capture(timeout=args.timeout)
+            frame = camera.get_frame(timeout=args.timeout)
             image = frame_to_image(frame, args.width, args.height)
             save_latest_frame(image, args.save_latest_frame)
-            decision = choose_command(model, processor, image, build_task_prompt(args.prompt, task))
+            
+            base64_image = image_to_base64(image)
+            prompt = build_task_prompt(args.prompt, task)
+            
+            logger.info("Model string input (prompt):\n%s", prompt)
+            
+            # Query VLM API
+            try:
+                if is_openai:
+                    raw_output = query_openai(openai_key, args.model, base64_image, prompt)
+                else:
+                    raw_output = query_gemini(gemini_key, args.model, base64_image, prompt)
+            except Exception as e:
+                logger.error("API request failed: %s", e)
+                steps += 1
+                time.sleep(max(0.0, interval - (time.monotonic() - started_at)))
+                continue
+
+            decision = parse_decision(raw_output)
             command = decision.command
 
             logger.info(
@@ -478,26 +387,13 @@ def run(args) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Drive an EV3 robot with model camera decisions.")
+    parser = argparse.ArgumentParser(description="Drive an EV3 robot with cloud model decisions (OpenAI or Gemini).")
     parser.add_argument("--host", default="10.45.151.18", help="EV3 TCP host, or ntfy:<topic> for remote mode.")
     parser.add_argument("--port", type=int, default=9999, help="EV3 TCP port.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Hugging Face model name or local path.")
     parser.add_argument(
-        "--torch-dtype",
-        choices=("auto", "float16", "float32", "bfloat16"),
-        default="auto",
-        help="Model dtype. auto uses float16 on MPS, float32 on CPU, and Transformers auto on CUDA.",
-    )
-    parser.add_argument(
-        "--device",
-        choices=("auto", "cpu", "mps"),
-        default="auto",
-        help="Device placement. Use cpu for the most reliable Intel Mac path.",
-    )
-    parser.add_argument(
-        "--local-files-only",
-        action="store_true",
-        help="Load only from the local Hugging Face cache.",
+        "--model", 
+        default="gemini-2.0-flash", 
+        help="Model identifier (e.g. gemini-2.0-flash, gemini-1.5-flash, gpt-4o, gpt-4o-mini)."
     )
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
     parser.add_argument("--hz", type=float, default=1.0, help="Decision frequency. Keep this around 1-2 Hz.")
@@ -515,12 +411,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--ask-task",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Ask for a task at startup and again whenever Qwen reports task_done=true.",
+        help="Ask for a task at startup and again whenever model reports task_done=true.",
     )
     parser.add_argument(
         "--save-latest-frame",
-        default="qwen_latest_frame.jpg",
-        help="Path to overwrite with the latest resized frame sent to Qwen. Use '' to disable.",
+        default="cloud_latest_frame.jpg",
+        help="Path to overwrite with the latest resized frame sent to model. Use '' to disable.",
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Decision prompt sent with each frame.")
     return parser
