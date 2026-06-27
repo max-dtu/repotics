@@ -1,0 +1,7 @@
+2026-06-26 17:26:54,627 [WARNING] Harness rejected VLM output: Error: You evaluated that progress 'improved' after 'right', but you are now choosing to undo it with 'left'. If progress was successful, you should build on it rather than reversing. Please choose a command that continues progress.
+
+
+But it could be that the model output "improved" but was wrong
+
+
+see https://docs.google.com/document/d/13R6fO19jBDTiMUE42gm2QueUE9f6xNdZF5hqaCyo3hA/edit?usp=sharing
